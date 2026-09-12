@@ -9,8 +9,13 @@ import (
 )
 
 func Diff(old, current model.Snapshot) model.Changes {
+	changes := model.Changes{SchemaVersion: model.SchemaVersion, ComparedAt: time.Now(), Items: []model.Change{}}
+	if old.FetchedAt.IsZero() && len(old.Students) == 0 {
+		return changes
+	}
 	knownGrades := map[string]bool{}
 	knownAbsences := map[string]bool{}
+	knownActivities := map[string]bool{}
 	oldSubjects := map[string]string{}
 	for _, student := range old.Students {
 		for _, grade := range student.Grades {
@@ -19,11 +24,13 @@ func Diff(old, current model.Snapshot) model.Changes {
 		for _, absence := range student.Absences {
 			knownAbsences[absence.ID] = true
 		}
+		for _, activity := range student.Activities {
+			knownActivities[activity.ID] = true
+		}
 		for _, subject := range student.Subjects {
 			oldSubjects[student.Student.ID+":"+subject.ID] = gradesKey(subject.DisplayedGrades)
 		}
 	}
-	changes := model.Changes{SchemaVersion: model.SchemaVersion, ComparedAt: time.Now(), Items: []model.Change{}}
 	for _, student := range current.Students {
 		for _, grade := range student.Grades {
 			if !knownGrades[grade.ID] {
@@ -33,6 +40,15 @@ func Diff(old, current model.Snapshot) model.Changes {
 		for _, absence := range student.Absences {
 			if !knownAbsences[absence.ID] {
 				changes.Items = append(changes.Items, model.Change{Kind: "absence_added", StudentID: absence.StudentID, RecordID: absence.ID, Summary: absence.Note})
+			}
+		}
+		for _, activity := range student.Activities {
+			if !knownActivities[activity.ID] {
+				summary := activity.Title
+				if activity.Note != "" {
+					summary += ": " + activity.Note
+				}
+				changes.Items = append(changes.Items, model.Change{Kind: "activity_added", StudentID: activity.StudentID, RecordID: activity.ID, Summary: summary})
 			}
 		}
 		for _, subject := range student.Subjects {

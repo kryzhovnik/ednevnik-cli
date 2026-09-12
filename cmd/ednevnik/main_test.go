@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +26,9 @@ func (f *fakeClient) Get(_ context.Context, path string) ([]byte, error) {
 	}
 	if path == "/absents?student=1234567" {
 		return []byte(`<div class="categories-wrap"><div class="category-item-wrap green"><span class="category-symbol-subtitle">2. час</span><div class="name">Mathematics</div><div class="name-subtitle">8. септембар 2026.</div></div></div>`), nil
+	}
+	if path == "/timeline-data?page=1&student=1234567" {
+		return []byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`), nil
 	}
 	return nil, os.ErrNotExist
 }
@@ -57,5 +62,48 @@ func TestSyncWritesSnapshotAndChanges(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("changes=%#v", changes)
+	}
+}
+
+type timelineClient struct{ paths []string }
+
+func (f *timelineClient) Login(context.Context, string, string) error { return nil }
+func (f *timelineClient) BudgetStatus() (string, int, int, error)     { return "2026-09-12", 0, 100, nil }
+func (f *timelineClient) Get(_ context.Context, path string) ([]byte, error) {
+	f.paths = append(f.paths, path)
+	if path == "/timeline-data?page=1&student=1234567" {
+		return []byte(`{"success":true,"meta":{"currentPage":1,"nextPage":2,"lastPage":2},"data":[{"date":{"day":"Monday"},"items":[{"id":1,"title":"Math","itemType":"activity"}]}]}`), nil
+	}
+	if path == "/timeline-data?page=2&student=1234567" {
+		return []byte(`{"success":true,"meta":{"currentPage":2,"nextPage":null,"lastPage":2},"data":[{"date":{"day":"Sunday"},"items":[{"id":2,"title":"English","itemType":"activity"}]}]}`), nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func TestTimelineLoadsAllPages(t *testing.T) {
+	fake := &timelineClient{}
+	a := &app{client: fake, dir: t.TempDir()}
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = a.timeline(context.Background(), []string{"--student", "1234567", "--all"})
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	var page model.ActivityPage
+	if err := json.Unmarshal(buf.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || len(fake.paths) != 2 {
+		t.Fatalf("page=%#v paths=%#v", page, fake.paths)
 	}
 }

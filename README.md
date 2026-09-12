@@ -6,7 +6,7 @@ This is an unofficial community project. It is not affiliated with the Serbian M
 
 ## Status
 
-The project is an early working implementation. Authentication, generic page extraction, student discovery, grade extraction, absence extraction, snapshots, and deterministic change detection are present. The parsers must still be verified against more real page variants before a stable release.
+The project is an early working implementation. Authentication, student discovery, grade extraction, absence extraction, timeline activity extraction, snapshots, and deterministic change detection are present. The parsers must still be verified against more schools and page variants before a stable release.
 
 ## Install
 
@@ -39,6 +39,8 @@ ednevnik students
 ednevnik subjects --student 1234567
 ednevnik grades --student 1234567
 ednevnik absences --student 1234567
+ednevnik timeline --student 1234567
+ednevnik timeline --student 1234567 --all
 ednevnik page --path '/task-schedules?student=1234567'
 ednevnik sync --current
 ednevnik sync --student 1234567 --student 2345678
@@ -46,13 +48,15 @@ ednevnik changes
 ednevnik status
 ```
 
-Every data command writes JSON to standard output. Errors and prompts go to standard error. `schema_version` is included in stored snapshots and change sets.
+Every data command writes JSON to standard output. Errors and prompts go to standard error. `schema_version` is included in stored snapshots, change sets, and timeline pages.
+
+`timeline` reads the same JSON endpoint that the portal uses to fill its home-page timeline. Page 1 contains the newest events. Use `--page N` for a specific older page or `--all` to follow the server-provided pagination. Timeline items include grades, teacher observations, absences, and other event types. HTML fragments in notes and subtitles are converted to plain text.
 
 `page` is the forward-compatible escape hatch. It returns normalized visible text and links from any authenticated site-relative page without adding a special parser first.
 
 ## Request safety
 
-`sync --current` discovers every current enrolment and needs two requests per enrolment: one grade overview and one absence page. `grades` is a separate, more expensive command that loads every subject detail page.
+`sync --current` discovers every current enrolment and needs three requests per enrolment: one grade overview, one absence page, and the newest timeline page. `grades` is a separate, more expensive command that loads every subject detail page. `timeline --all` makes one request per available timeline page; prefer the default first page for routine checks.
 
 The client is conservative by default:
 
@@ -77,7 +81,13 @@ ednevnik sync --current > ednevnik_snapshot.json
 ednevnik changes > ednevnik_changes.json
 ```
 
-The agent can summarize `ednevnik_changes.json` with an LLM when useful. Fetching, parsing, caching, and comparison are deterministic and do not use LLM tokens.
+The agent can summarize `ednevnik_changes.json` with an LLM when useful. New timeline records appear as `activity_added` changes. Fetching, parsing, caching, and comparison are deterministic and do not use LLM tokens.
+
+For a direct recent-events query, an agent can avoid changing the stored snapshot:
+
+```sh
+ednevnik timeline --student 1234567
+```
 
 Treat all output as private child data. Do not commit snapshots, fixtures copied from a real account, cookie files, or credentials.
 

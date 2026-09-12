@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"html"
 	"net/url"
 	"regexp"
 	"sort"
@@ -216,6 +218,78 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 		out = append(out, model.Absence{ID: id, StudentID: studentID, Subject: subject, Date: date, Period: period, Status: status, Note: note})
 	})
 	return dedupeAbsences(out), nil
+}
+
+type timelineResponse struct {
+	Success bool `json:"success"`
+	Meta    struct {
+		CurrentPage int  `json:"currentPage"`
+		NextPage    *int `json:"nextPage"`
+		LastPage    int  `json:"lastPage"`
+	} `json:"meta"`
+	Data []struct {
+		Date struct {
+			Day string `json:"day"`
+		} `json:"date"`
+		Items []struct {
+			ID          int64  `json:"id"`
+			Date        string `json:"date"`
+			TypeName    string `json:"typeName"`
+			TypeClass   string `json:"typeClass"`
+			Title       string `json:"title"`
+			SymbolValue any    `json:"symbolValue"`
+			Subtitle    string `json:"subtitle"`
+			Note        string `json:"note"`
+			IsNew       bool   `json:"isNew"`
+			ItemURL     string `json:"itemUrl"`
+			ItemType    string `json:"itemType"`
+		} `json:"items"`
+	} `json:"data"`
+}
+
+// Timeline parses the JSON returned by /timeline-data. Text fields can contain
+// small HTML fragments, so they are normalized to plain text for stable output.
+func Timeline(body []byte, studentID string) (model.ActivityPage, error) {
+	var raw timelineResponse
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return model.ActivityPage{}, fmt.Errorf("decode timeline JSON: %w", err)
+	}
+	if !raw.Success {
+		return model.ActivityPage{}, fmt.Errorf("timeline request was not successful")
+	}
+	page := model.ActivityPage{SchemaVersion: model.SchemaVersion, CurrentPage: raw.Meta.CurrentPage, NextPage: raw.Meta.NextPage, LastPage: raw.Meta.LastPage, Items: []model.Activity{}}
+	for _, group := range raw.Data {
+		for _, item := range group.Items {
+			typeID := plainText(item.ItemType)
+			if typeID == "" {
+				typeID = plainText(item.TypeClass)
+			}
+			symbol := ""
+			switch value := item.SymbolValue.(type) {
+			case string:
+				symbol = plainText(value)
+			case float64:
+				symbol = fmt.Sprintf("%g", value)
+			}
+			portalID := fmt.Sprintf("%d", item.ID)
+			page.Items = append(page.Items, model.Activity{
+				ID: stableID(studentID, typeID, portalID), StudentID: studentID, PortalID: item.ID,
+				Date: plainText(item.Date), Day: plainText(group.Date.Day), Type: typeID,
+				TypeName: plainText(item.TypeName), Title: plainText(item.Title), Symbol: symbol,
+				Subtitle: plainText(item.Subtitle), Note: plainText(item.Note), URL: item.ItemURL, IsNew: item.IsNew,
+			})
+		}
+	}
+	return page, nil
+}
+
+func plainText(value string) string {
+	value = html.UnescapeString(value)
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader("<div>" + value + "</div>"))
+	if err != nil {
+		return clean(value)
+	}
+	return clean(doc.Find("div").First().Text())
 }
 
 func clean(s string) string { return strings.Join(strings.Fields(s), " ") }

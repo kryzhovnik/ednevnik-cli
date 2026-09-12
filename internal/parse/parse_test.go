@@ -88,3 +88,18 @@ func TestAbsences(t *testing.T) {
 		t.Fatalf("second = %#v", items[1])
 	}
 }
+
+func TestTimeline(t *testing.T) {
+	body := []byte(`{"success":true,"meta":{"currentPage":1,"nextPage":2,"lastPage":3},"data":[{"date":{"date":"11. септембар","timestamp":1,"day":"Петак"},"items":[{"id":42,"date":"11. 09. 2026.","typeName":"Активност","typeClass":"activity blue","title":"Математика","symbolValue":null,"subtitle":"&lt;b&gt;Усмено&lt;/b&gt;","note":"Није усвојио &lt;strong&gt;квадрирање&lt;/strong&gt;.","isNew":true,"itemUrl":"https:\/\/example.test\/activities\/42\/show","itemType":"activity"}]}]}`)
+	page, err := Timeline(body, "1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.CurrentPage != 1 || page.NextPage == nil || *page.NextPage != 2 || len(page.Items) != 1 {
+		t.Fatalf("page = %#v", page)
+	}
+	item := page.Items[0]
+	if item.Type != "activity" || item.Title != "Математика" || item.Subtitle != "Усмено" || item.Note != "Није усвојио квадрирање." || !item.IsNew {
+		t.Fatalf("item = %#v", item)
+	}
+}

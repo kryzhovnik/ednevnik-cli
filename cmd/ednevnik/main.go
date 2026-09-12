@@ -7,8 +7,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -68,6 +70,8 @@ func run(ctx context.Context, args []string) error {
 		return a.grades(ctx, args[1:])
 	case "absences":
 		return a.absences(ctx, args[1:])
+	case "timeline", "activities":
+		return a.timeline(ctx, args[1:])
 	case "page":
 		return a.page(ctx, args[1:])
 	case "sync":
@@ -196,6 +200,51 @@ func (a *app) absences(ctx context.Context, args []string) error {
 	return output(items)
 }
 
+func (a *app) timeline(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("timeline", flag.ContinueOnError)
+	studentID := fs.String("student", "", "student enrolment ID")
+	pageNumber := fs.Int("page", 1, "timeline page to fetch")
+	allPages := fs.Bool("all", false, "fetch all available timeline pages")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := validateStudentID(*studentID); err != nil {
+		return fmt.Errorf("timeline: %w", err)
+	}
+	if *pageNumber < 1 {
+		return errors.New("timeline page must be positive")
+	}
+	page, err := a.loadTimeline(ctx, *studentID, *pageNumber)
+	if err != nil {
+		return err
+	}
+	if *allPages {
+		seen := map[int]bool{page.CurrentPage: true}
+		for next := page.NextPage; next != nil && *next <= page.LastPage; next = page.NextPage {
+			if seen[*next] {
+				return errors.New("timeline pagination repeated a page; the site response may have changed")
+			}
+			seen[*next] = true
+			more, err := a.loadTimeline(ctx, *studentID, *next)
+			if err != nil {
+				return err
+			}
+			page.Items = append(page.Items, more.Items...)
+			page.NextPage = more.NextPage
+		}
+	}
+	return output(page)
+}
+
+func (a *app) loadTimeline(ctx context.Context, studentID string, page int) (model.ActivityPage, error) {
+	query := url.Values{"student": {studentID}, "page": {strconv.Itoa(page)}}
+	body, err := a.client.Get(ctx, "/timeline-data?"+query.Encode())
+	if err != nil {
+		return model.ActivityPage{}, err
+	}
+	return parse.Timeline(body, studentID)
+}
+
 func (a *app) page(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("page", flag.ContinueOnError)
 	path := fs.String("path", "", "site-relative path to fetch")
@@ -276,6 +325,11 @@ func (a *app) sync(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		activities, err := a.loadTimeline(ctx, studentID, 1)
+		if err != nil {
+			return err
+		}
+		current.Activities = activities.Items
 		snapshot.Students = append(snapshot.Students, current)
 	}
 	changes := store.Diff(previous, snapshot)
@@ -300,7 +354,7 @@ func (a *app) loadOverview(ctx context.Context, studentID string) (model.Student
 	if err != nil {
 		return model.StudentData{}, err
 	}
-	return model.StudentData{Student: model.Student{ID: studentID}, Subjects: subjects, Grades: []model.Grade{}, Absences: []model.Absence{}}, nil
+	return model.StudentData{Student: model.Student{ID: studentID}, Subjects: subjects, Grades: []model.Grade{}, Absences: []model.Absence{}, Activities: []model.Activity{}}, nil
 }
 
 func (a *app) changes() error {
@@ -382,11 +436,12 @@ Usage:
   ednevnik subjects --student ID
   ednevnik grades --student ID
   ednevnik absences --student ID
+  ednevnik timeline --student ID [--page N | --all]
   ednevnik page --path '/task-schedules?student=ID'
   ednevnik sync --current
   ednevnik sync --student ID --student ID
   ednevnik changes
   ednevnik status
 
-All data commands write versioned JSON to stdout. Diagnostics go to stderr.`)
+All data commands write JSON to stdout. Snapshots, changes, and timeline pages include a schema version. Diagnostics go to stderr.`)
 }
