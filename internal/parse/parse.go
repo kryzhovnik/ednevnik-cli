@@ -23,8 +23,9 @@ var (
 )
 
 type Link struct {
-	Text string `json:"text"`
-	URL  string `json:"url"`
+	Text        string `json:"text"`
+	Description string `json:"description,omitempty"`
+	URL         string `json:"url"`
 }
 
 type Page struct {
@@ -50,7 +51,14 @@ func GenericPage(body []byte, baseURL string) (Page, error) {
 		if err == nil {
 			href = u.String()
 		}
-		p.Links = append(p.Links, Link{Text: clean(s.Text()), URL: href})
+		description := ""
+		for _, attribute := range []string{"aria-label", "title", "data-original-title"} {
+			if value, ok := s.Attr(attribute); ok && clean(value) != "" {
+				description = clean(value)
+				break
+			}
+		}
+		p.Links = append(p.Links, Link{Text: clean(s.Text()), Description: description, URL: href})
 	})
 	return p, nil
 }

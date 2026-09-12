@@ -60,12 +60,15 @@ func TestSubjectsAndGrades(t *testing.T) {
 }
 
 func TestGenericPage(t *testing.T) {
-	p, err := GenericPage([]byte(`<html><head><title> Page </title></head><body><a href="/grades"> Grades </a></body></html>`), "https://example.test")
+	p, err := GenericPage([]byte(`<html><head><title> Page </title></head><body><a href="/grades" aria-label="Grade activity detail"> Grades </a></body></html>`), "https://example.test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p.Title != "Page" || len(p.Links) != 1 || p.Links[0].URL != "https://example.test/grades" {
 		t.Fatalf("page = %#v", p)
+	}
+	if p.Links[0].Description != "Grade activity detail" {
+		t.Fatalf("description = %q", p.Links[0].Description)
 	}
 }
 
