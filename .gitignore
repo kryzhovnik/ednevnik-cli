@@ -1,0 +1,6 @@
+/ednevnik
+/dist/
+/.idea/
+/.vscode/
+.DS_Store
+coverage.out
