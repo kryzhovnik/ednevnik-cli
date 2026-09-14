@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/store"
 )
@@ -31,6 +32,41 @@ func (f *fakeClient) Get(_ context.Context, path string) ([]byte, error) {
 		return []byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`), nil
 	}
 	return nil, os.ErrNotExist
+}
+
+type retryClient struct {
+	gets   int
+	logins int
+}
+
+func (f *retryClient) Login(context.Context, string, string) error {
+	f.logins++
+	return nil
+}
+func (f *retryClient) BudgetStatus() (string, int, int, error) { return "2026-09-12", 0, 100, nil }
+func (f *retryClient) Get(context.Context, string) ([]byte, error) {
+	f.gets++
+	if f.gets == 1 {
+		return nil, client.ErrNotAuthenticated
+	}
+	return []byte("ok"), nil
+}
+
+type fakeCredentials struct{}
+
+func (fakeCredentials) PromptSave(string) error       { return nil }
+func (fakeCredentials) Load() (string, string, error) { return "user", "password", nil }
+
+func TestGetAutomaticallyLogsInAndRetries(t *testing.T) {
+	fake := &retryClient{}
+	a := &app{client: fake, creds: fakeCredentials{}}
+	body, err := a.get(context.Background(), "/grades")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ok" || fake.gets != 2 || fake.logins != 1 {
+		t.Fatalf("body=%q gets=%d logins=%d", body, fake.gets, fake.logins)
+	}
 }
 
 func TestSyncWritesSnapshotAndChanges(t *testing.T) {
@@ -62,6 +98,21 @@ func TestSyncWritesSnapshotAndChanges(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("changes=%#v", changes)
+	}
+}
+
+func TestConsumerUsesIndependentStateDirectory(t *testing.T) {
+	a := &app{dir: t.TempDir()}
+	defaultDir, err := a.consumerDir("")
+	if err != nil || defaultDir != a.dir {
+		t.Fatalf("defaultDir=%q err=%v", defaultDir, err)
+	}
+	pasDir, err := a.consumerDir("pas")
+	if err != nil || pasDir != filepath.Join(a.dir, "consumers", "pas") {
+		t.Fatalf("pasDir=%q err=%v", pasDir, err)
+	}
+	if _, err := a.consumerDir("../pas"); err == nil {
+		t.Fatal("unsafe consumer name accepted")
 	}
 }
 

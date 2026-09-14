@@ -41,3 +41,28 @@ func TestDiffDetectsNewActivity(t *testing.T) {
 		t.Fatalf("changes = %#v", changes)
 	}
 }
+
+func TestDiffIncludesStudentAndRecordDetails(t *testing.T) {
+	old := model.Snapshot{FetchedAt: time.Now(), Students: []model.StudentData{{Student: model.Student{ID: "s1", Name: "Mark"}}}}
+	current := model.Snapshot{Students: []model.StudentData{{Student: model.Student{ID: "s1", Name: "Mark"}, Absences: []model.Absence{{ID: "new", StudentID: "s1", Subject: "French", Date: "08. 09. 2026.", Period: "2. Час", Status: "unexcused", Note: "Bonjour"}}}}}
+	changes := Diff(old, current)
+	if len(changes.Items) != 1 {
+		t.Fatalf("changes = %#v", changes)
+	}
+	change := changes.Items[0]
+	if change.StudentName != "Mark" || change.Subject != "French" || change.Date != "08. 09. 2026." || change.Period != "2. Час" || change.Status != "unexcused" {
+		t.Fatalf("change = %#v", change)
+	}
+}
+
+func TestDiffDoesNotReportHistoryForNewEnrollment(t *testing.T) {
+	old := model.Snapshot{FetchedAt: time.Now(), Students: []model.StudentData{{Student: model.Student{ID: "s1", Name: "Mark"}}}}
+	current := model.Snapshot{Students: []model.StudentData{
+		{Student: model.Student{ID: "s1", Name: "Mark"}},
+		{Student: model.Student{ID: "s2", Name: "Mary"}, Absences: []model.Absence{{ID: "history", StudentID: "s2"}}, Activities: []model.Activity{{ID: "history", StudentID: "s2"}}},
+	}}
+	changes := Diff(old, current)
+	if len(changes.Items) != 0 {
+		t.Fatalf("changes = %#v", changes)
+	}
+}

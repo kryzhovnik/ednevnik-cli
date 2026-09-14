@@ -83,14 +83,23 @@ type Snapshot struct {
 }
 
 type Change struct {
-	Kind      string `json:"kind"`
-	StudentID string `json:"student_id"`
-	RecordID  string `json:"record_id"`
-	Summary   string `json:"summary"`
+	Kind        string `json:"kind"`
+	StudentID   string `json:"student_id"`
+	StudentName string `json:"student_name"`
+	RecordID    string `json:"record_id"`
+	Date        string `json:"date,omitempty"`
+	Subject     string `json:"subject,omitempty"`
+	Period      string `json:"period,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Value       string `json:"value,omitempty"`
+	Note        string `json:"note,omitempty"`
+	Summary     string `json:"summary"`
 }
 
 type Changes struct {
 	SchemaVersion int       `json:"schema_version"`
 	ComparedAt    time.Time `json:"compared_at"`
+	From          time.Time `json:"from,omitempty"`
+	To            time.Time `json:"to,omitempty"`
 	Items         []Change  `json:"items"`
 }

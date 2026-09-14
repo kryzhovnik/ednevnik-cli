@@ -26,6 +26,17 @@ func TestStudents(t *testing.T) {
 	}
 }
 
+func TestStudentsUsesCurrentIDForActiveLinkWithoutStudentQuery(t *testing.T) {
+	html := []byte(`<timeline :student-class-id="222"></timeline><div class="card student"><div class="card-header"><h5>Mark</h5></div><a class="student-school-class-wrap active" href="/"><div class="student-school-class-item">School</div><div class="student-school-class-item school-class-strong">VII b</div><div class="student-school-class-item">26/27</div></a><a class="student-school-class-wrap" href="/?student=111"><div class="student-school-class-item">School</div><div class="student-school-class-item school-class-strong">VI b</div><div class="student-school-class-item">25/26</div></a></div>`)
+	students, err := Students(html, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(students) != 2 || students[0].ID != "222" || !students[0].Current || !students[0].Selected {
+		t.Fatalf("students = %#v", students)
+	}
+}
+
 func TestSubjectsAndGrades(t *testing.T) {
 	index := []byte(`<a class="flex-table-row" href="/grades/7654321/show?student=1234567"><div><strong class="d-block">Mathematics</strong><em>Teacher Name</em></div><div class="grades-cell-wrap"><div class="grade numeric">5</div></div></a>`)
 	subjects, err := Subjects(index)
@@ -86,6 +97,17 @@ func TestAbsences(t *testing.T) {
 	}
 	if items[1].Status != "excused" {
 		t.Fatalf("second = %#v", items[1])
+	}
+}
+
+func TestAbsencesReadsDateFromGroupAndFullPeriodFromItem(t *testing.T) {
+	body := []byte(`<div class="categories-wrap"><div class="category-wrap"><div class="category-top"><span>уторак</span><strong>08. 09. 2026.</strong></div><div class="category-items-wrap"><div class="category-item-wrap red"><div class="category-symbol">2.<span class="category-symbol-subtitle">Час</span></div><div class="name">Француски језик</div><div class="name-subtitle">Неоправдан изостанак</div><div class="category-item-bottom-note">Bonjour la rentrée</div></div></div></div></div>`)
+	items, err := Absences(body, "1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Date != "08. 09. 2026." || items[0].Period != "2. Час" {
+		t.Fatalf("items = %#v", items)
 	}
 }
 

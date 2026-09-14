@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/kryzhovnik/ednevnik/internal/client"
+	"github.com/kryzhovnik/ednevnik/internal/credentials"
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
@@ -27,6 +28,12 @@ const version = "0.1.0-dev"
 type app struct {
 	client siteClient
 	dir    string
+	creds  credentialStore
+}
+
+type credentialStore interface {
+	PromptSave(string) error
+	Load() (string, string, error)
 }
 
 type siteClient interface {
@@ -52,16 +59,17 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	dir := filepath.Join(configDir, "ednevnik")
+	stateDir := envOr("EDNEVNIK_STATE_DIR", dir)
 	baseURL := envOr("EDNEVNIK_BASE_URL", client.DefaultBaseURL)
 	c, err := client.New(baseURL, filepath.Join(dir, "session.json"), 2500*time.Millisecond)
 	if err != nil {
 		return err
 	}
-	a := &app{client: c, dir: dir}
+	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}}
 
 	switch args[0] {
 	case "login":
-		return a.login(ctx)
+		return a.login(ctx, args[1:])
 	case "students":
 		return a.students(ctx)
 	case "subjects":
@@ -77,9 +85,9 @@ func run(ctx context.Context, args []string) error {
 	case "sync":
 		return a.sync(ctx, args[1:])
 	case "changes":
-		return a.changes()
+		return a.changes(args[1:])
 	case "status":
-		return a.status()
+		return a.status(args[1:])
 	case "version":
 		fmt.Println(version)
 		return nil
@@ -92,7 +100,12 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 
-func (a *app) login(ctx context.Context) error {
+func (a *app) login(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	save := fs.Bool("save", false, "save credentials in macOS Keychain for automatic re-login")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	username := os.Getenv("EDNEVNIK_USERNAME")
 	password := os.Getenv("EDNEVNIK_PASSWORD")
 	reader := bufio.NewReader(os.Stdin)
@@ -101,7 +114,20 @@ func (a *app) login(ctx context.Context) error {
 		username, _ = reader.ReadString('\n')
 		username = strings.TrimSpace(username)
 	}
-	if password == "" {
+	if *save && password == "" {
+		if a.creds == nil {
+			return errors.New("credential storage is unavailable")
+		}
+		fmt.Fprintln(os.Stderr, "Password will be stored in macOS Keychain.")
+		if err := a.creds.PromptSave(username); err != nil {
+			return fmt.Errorf("save credentials: %w", err)
+		}
+		storedUsername, storedPassword, err := a.creds.Load()
+		if err != nil {
+			return err
+		}
+		username, password = storedUsername, storedPassword
+	} else if password == "" {
 		fmt.Fprint(os.Stderr, "Password: ")
 		b, err := term.ReadPassword(int(syscall.Stdin))
 		fmt.Fprintln(os.Stderr)
@@ -116,12 +142,30 @@ func (a *app) login(ctx context.Context) error {
 	if err := a.client.Login(ctx, username, password); err != nil {
 		return err
 	}
+	if *save && os.Getenv("EDNEVNIK_PASSWORD") != "" {
+		return errors.New("cannot save EDNEVNIK_PASSWORD securely; unset it and run interactively")
+	}
 	fmt.Println("Login successful. Session saved locally with mode 0600.")
 	return nil
 }
 
+func (a *app) get(ctx context.Context, path string) ([]byte, error) {
+	body, err := a.client.Get(ctx, path)
+	if !errors.Is(err, client.ErrNotAuthenticated) || a.creds == nil {
+		return body, err
+	}
+	username, password, loadErr := a.creds.Load()
+	if loadErr != nil {
+		return nil, loadErr
+	}
+	if loginErr := a.client.Login(ctx, username, password); loginErr != nil {
+		return nil, fmt.Errorf("automatic login: %w", loginErr)
+	}
+	return a.client.Get(ctx, path)
+}
+
 func (a *app) students(ctx context.Context) error {
-	body, err := a.client.Get(ctx, "/")
+	body, err := a.get(ctx, "/")
 	if err != nil {
 		return err
 	}
@@ -149,7 +193,7 @@ func (a *app) subjects(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	body, err := a.client.Get(ctx, "/grades?student="+studentID)
+	body, err := a.get(ctx, "/grades?student="+studentID)
 	if err != nil {
 		return err
 	}
@@ -161,7 +205,7 @@ func (a *app) subjects(ctx context.Context, args []string) error {
 }
 
 func (a *app) loadGrades(ctx context.Context, studentID string) (model.StudentData, error) {
-	body, err := a.client.Get(ctx, "/grades?student="+studentID)
+	body, err := a.get(ctx, "/grades?student="+studentID)
 	if err != nil {
 		return model.StudentData{}, err
 	}
@@ -171,7 +215,7 @@ func (a *app) loadGrades(ctx context.Context, studentID string) (model.StudentDa
 	}
 	data := model.StudentData{Student: model.Student{ID: studentID}, Subjects: subjects, Grades: []model.Grade{}, Absences: []model.Absence{}}
 	for _, subject := range subjects {
-		body, err = a.client.Get(ctx, "/grades/"+subject.ID+"/show?student="+studentID)
+		body, err = a.get(ctx, "/grades/"+subject.ID+"/show?student="+studentID)
 		if err != nil {
 			return model.StudentData{}, err
 		}
@@ -189,7 +233,7 @@ func (a *app) absences(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	body, err := a.client.Get(ctx, "/absents?student="+studentID)
+	body, err := a.get(ctx, "/absents?student="+studentID)
 	if err != nil {
 		return err
 	}
@@ -238,7 +282,7 @@ func (a *app) timeline(ctx context.Context, args []string) error {
 
 func (a *app) loadTimeline(ctx context.Context, studentID string, page int) (model.ActivityPage, error) {
 	query := url.Values{"student": {studentID}, "page": {strconv.Itoa(page)}}
-	body, err := a.client.Get(ctx, "/timeline-data?"+query.Encode())
+	body, err := a.get(ctx, "/timeline-data?"+query.Encode())
 	if err != nil {
 		return model.ActivityPage{}, err
 	}
@@ -254,7 +298,7 @@ func (a *app) page(ctx context.Context, args []string) error {
 	if *path == "" || !strings.HasPrefix(*path, "/") {
 		return errors.New("page requires --path beginning with /")
 	}
-	body, err := a.client.Get(ctx, *path)
+	body, err := a.get(ctx, *path)
 	if err != nil {
 		return err
 	}
@@ -271,6 +315,7 @@ func (a *app) sync(ctx context.Context, args []string) error {
 	fs.Var(&students, "student", "student enrolment ID; repeat for several students")
 	currentOnly := fs.Bool("current", false, "discover and sync every current enrolment")
 	force := fs.Bool("force", false, "sync even if the last sync was less than 30 minutes ago")
+	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -282,7 +327,7 @@ func (a *app) sync(ctx context.Context, args []string) error {
 	}
 	studentInfo := map[string]model.Student{}
 	if *currentOnly {
-		body, err := a.client.Get(ctx, "/")
+		body, err := a.get(ctx, "/")
 		if err != nil {
 			return err
 		}
@@ -302,7 +347,11 @@ func (a *app) sync(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	latest := filepath.Join(a.dir, "latest.json")
+	stateDir, err := a.consumerDir(*consumer)
+	if err != nil {
+		return err
+	}
+	latest := filepath.Join(stateDir, "latest.json")
 	var previous model.Snapshot
 	_ = store.LoadSnapshot(latest, &previous)
 	if !*force && !previous.FetchedAt.IsZero() && time.Since(previous.FetchedAt) < 30*time.Minute {
@@ -317,7 +366,7 @@ func (a *app) sync(ctx context.Context, args []string) error {
 		if info, ok := studentInfo[studentID]; ok {
 			current.Student = info
 		}
-		body, err := a.client.Get(ctx, "/absents?student="+studentID)
+		body, err := a.get(ctx, "/absents?student="+studentID)
 		if err != nil {
 			return err
 		}
@@ -333,20 +382,23 @@ func (a *app) sync(ctx context.Context, args []string) error {
 		snapshot.Students = append(snapshot.Students, current)
 	}
 	changes := store.Diff(previous, snapshot)
-	if err := store.SaveSnapshot(filepath.Join(a.dir, "previous.json"), previous); err != nil {
+	if err := store.SaveSnapshot(filepath.Join(stateDir, "previous.json"), previous); err != nil {
 		return err
 	}
 	if err := store.SaveSnapshot(latest, snapshot); err != nil {
 		return err
 	}
-	if err := store.SaveSnapshot(filepath.Join(a.dir, "changes.json"), changes); err != nil {
+	if err := store.SaveSnapshot(filepath.Join(stateDir, "changes.json"), changes); err != nil {
+		return err
+	}
+	if err := appendCheckHistory(filepath.Join(stateDir, "checks.jsonl"), changes); err != nil {
 		return err
 	}
 	return output(snapshot)
 }
 
 func (a *app) loadOverview(ctx context.Context, studentID string) (model.StudentData, error) {
-	body, err := a.client.Get(ctx, "/grades?student="+studentID)
+	body, err := a.get(ctx, "/grades?student="+studentID)
 	if err != nil {
 		return model.StudentData{}, err
 	}
@@ -357,21 +409,39 @@ func (a *app) loadOverview(ctx context.Context, studentID string) (model.Student
 	return model.StudentData{Student: model.Student{ID: studentID}, Subjects: subjects, Grades: []model.Grade{}, Absences: []model.Absence{}, Activities: []model.Activity{}}, nil
 }
 
-func (a *app) changes() error {
+func (a *app) changes(args []string) error {
+	fs := flag.NewFlagSet("changes", flag.ContinueOnError)
+	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	stateDir, err := a.consumerDir(*consumer)
+	if err != nil {
+		return err
+	}
 	var changes model.Changes
-	if err := store.LoadSnapshot(filepath.Join(a.dir, "changes.json"), &changes); err != nil {
+	if err := store.LoadSnapshot(filepath.Join(stateDir, "changes.json"), &changes); err != nil {
 		return err
 	}
 	return output(changes)
 }
 
-func (a *app) status() error {
+func (a *app) status(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	stateDir, err := a.consumerDir(*consumer)
+	if err != nil {
+		return err
+	}
 	date, count, limit, budgetErr := a.client.BudgetStatus()
 	if budgetErr != nil {
 		return budgetErr
 	}
 	var snapshot model.Snapshot
-	err := store.LoadSnapshot(filepath.Join(a.dir, "latest.json"), &snapshot)
+	err = store.LoadSnapshot(filepath.Join(stateDir, "latest.json"), &snapshot)
 	if os.IsNotExist(err) {
 		return output(map[string]any{"configured": true, "has_snapshot": false, "request_budget": map[string]any{"date": date, "used": count, "limit": limit}})
 	}
@@ -379,6 +449,35 @@ func (a *app) status() error {
 		return err
 	}
 	return output(map[string]any{"configured": true, "has_snapshot": true, "last_sync": snapshot.FetchedAt, "students": len(snapshot.Students), "request_budget": map[string]any{"date": date, "used": count, "limit": limit}})
+}
+
+func (a *app) consumerDir(consumer string) (string, error) {
+	if consumer == "" {
+		return a.dir, nil
+	}
+	for _, r := range consumer {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return "", errors.New("consumer must contain only lowercase letters, digits, and underscores")
+		}
+	}
+	return filepath.Join(a.dir, "consumers", consumer), nil
+}
+
+func appendCheckHistory(path string, changes model.Changes) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return json.NewEncoder(file).Encode(map[string]any{
+		"checked_at":   changes.ComparedAt,
+		"from":         changes.From,
+		"to":           changes.To,
+		"change_count": len(changes.Items),
+	})
 }
 
 func requiredStudent(args []string, name string) (string, error) {
@@ -431,17 +530,17 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `ednevnik - read structured data from moj.esdnevnik.rs
 
 Usage:
-  ednevnik login
+  ednevnik login [--save]
   ednevnik students
   ednevnik subjects --student ID
   ednevnik grades --student ID
   ednevnik absences --student ID
   ednevnik timeline --student ID [--page N | --all]
   ednevnik page --path '/task-schedules?student=ID'
-  ednevnik sync --current
-  ednevnik sync --student ID --student ID
-  ednevnik changes
-  ednevnik status
+  ednevnik sync --current [--consumer NAME]
+  ednevnik sync --student ID --student ID [--consumer NAME]
+  ednevnik changes [--consumer NAME]
+  ednevnik status [--consumer NAME]
 
 All data commands write JSON to stdout. Snapshots, changes, and timeline pages include a schema version. Diagnostics go to stderr.`)
 }

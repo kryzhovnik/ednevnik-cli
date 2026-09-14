@@ -70,14 +70,22 @@ func Students(body []byte, currentID string) ([]model.Student, error) {
 	if err != nil {
 		return nil, err
 	}
+	if currentID == "" {
+		currentID, _ = doc.Find("timeline").First().Attr(":student-class-id")
+	}
 	byID := map[string]model.Student{}
-	doc.Find(`a[href*="student="]`).Each(func(_ int, s *goquery.Selection) {
+	doc.Find(`a.student-school-class-wrap`).Each(func(_ int, s *goquery.Selection) {
 		href, _ := s.Attr("href")
 		match := studentIDPattern.FindStringSubmatch(href)
-		if len(match) != 2 {
+		id := ""
+		if len(match) == 2 {
+			id = match[1]
+		} else if s.HasClass("active") {
+			id = currentID
+		}
+		if id == "" {
 			return
 		}
-		id := match[1]
 		card := s.Closest(".card.student")
 		name := clean(card.Find(".card-header h5").First().Clone().Children().Remove().End().Text())
 		items := selectionTexts(s.Find(".student-school-class-item"))
@@ -85,7 +93,7 @@ func Students(body []byte, currentID string) ([]model.Student, error) {
 		if old, exists := byID[id]; exists && old.Name != "" {
 			return
 		}
-		student := model.Student{ID: id, Name: name, Selected: s.HasClass("active") || id == currentID}
+		student := model.Student{ID: id, Name: name, Selected: id == currentID}
 		if len(items) > 0 {
 			student.School = items[0]
 		}
@@ -107,14 +115,14 @@ func Students(body []byte, currentID string) ([]model.Student, error) {
 	for _, s := range byID {
 		students = append(students, s)
 	}
-	latestYear := map[string]string{}
+	latestYear := ""
 	for _, s := range students {
-		if s.SchoolYear > latestYear[s.Name] {
-			latestYear[s.Name] = s.SchoolYear
+		if s.SchoolYear > latestYear {
+			latestYear = s.SchoolYear
 		}
 	}
 	for i := range students {
-		students[i].Current = students[i].SchoolYear != "" && students[i].SchoolYear == latestYear[students[i].Name]
+		students[i].Current = students[i].SchoolYear != "" && students[i].SchoolYear == latestYear && !strings.Contains(students[i].Class, "Исписан")
 	}
 	sort.Slice(students, func(i, j int) bool {
 		if students[i].Current != students[j].Current {
@@ -201,8 +209,10 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 	var out []model.Absence
 	doc.Find(".categories-wrap .category-item-wrap").Each(func(_ int, s *goquery.Selection) {
 		subject := clean(s.Find(".name").First().Text())
-		date := clean(s.Find(".name-subtitle").First().Text())
-		period := clean(s.Find(".category-symbol-subtitle").First().Text())
+		dateText := clean(s.Closest(".category-wrap").Find(".category-top").First().Text())
+		date := clean(datePattern.FindString(dateText))
+		periodNumber := clean(s.Find(".category-symbol").First().Clone().Children().Remove().End().Text())
+		period := clean(periodNumber + " " + s.Find(".category-symbol-subtitle").First().Text())
 		note := clean(s.Find(".category-item-bottom-note").First().Text())
 		if subject == "" && date == "" {
 			return
