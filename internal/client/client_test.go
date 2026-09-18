@@ -55,7 +55,7 @@ func TestLoginPersistsSessionForNextClient(t *testing.T) {
 		http.SetCookie(w, &http.Cookie{Name: "session", Value: "valid", Path: "/"})
 		http.Redirect(w, r, "/", http.StatusFound)
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "home") })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `<div class="students-list"></div>`) })
 	mux.HandleFunc("/private", func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session")
 		if err != nil || cookie.Value != "valid" {
@@ -68,7 +68,7 @@ func TestLoginPersistsSessionForNextClient(t *testing.T) {
 	defer server.Close()
 	sessionPath := filepath.Join(t.TempDir(), "session.json")
 	root := t.TempDir()
-	c, err := New(server.URL, sessionPath, testLease(t, root, server.URL))
+	c, err := New(server.URL, sessionPath, "test", testLease(t, root, server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestLoginPersistsSessionForNextClient(t *testing.T) {
 	}
 	// A command releases its account lease before the next command starts.
 	_ = c.lease.Release()
-	c2, err := New(server.URL, sessionPath, testLease(t, root, server.URL))
+	c2, err := New(server.URL, sessionPath, "test", testLease(t, root, server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,13 +90,51 @@ func TestLoginPersistsSessionForNextClient(t *testing.T) {
 	}
 }
 
+func TestLoginAndReadOverLocalTLS(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, `<input name="_token" value="csrf">`)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: "tls", Path: "/", Secure: true})
+		http.Redirect(w, r, "/", http.StatusFound)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if cookie, err := r.Cookie("session"); err != nil || cookie.Value != "tls" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		fmt.Fprint(w, `<div class="students-list"></div>`)
+	})
+	server := httptest.NewTLSServer(mux)
+	defer server.Close()
+	c, err := newClient(server.URL, filepath.Join(t.TempDir(), "session.json"), "test", testLease(t, t.TempDir(), server.URL), server.Client().Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Login(context.Background(), "synthetic", "password"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Get(context.Background(), "/"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticatedPageAllowsLogoutCSRFToken(t *testing.T) {
+	body := []byte(`<div class="students-list"></div><form action="/logout"><input name="_token" value="csrf"></form>`)
+	if !authenticatedPage(body) {
+		t.Fatal("authenticated logout CSRF form rejected")
+	}
+}
+
 func TestGetReportsExpiredSession(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/private", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/login", http.StatusFound) })
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "login") })
 	server := httptest.NewServer(mux)
 	defer server.Close()
-	c, err := New(server.URL, filepath.Join(t.TempDir(), "session.json"), testLease(t, t.TempDir(), server.URL))
+	c, err := New(server.URL, filepath.Join(t.TempDir(), "session.json"), "test", testLease(t, t.TempDir(), server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +157,7 @@ func TestRedirectsAndRetriesEachConsumeBudget(t *testing.T) {
 		}))
 		defer server.Close()
 		lease := testLease(t, t.TempDir(), server.URL)
-		c, err := New(server.URL, filepath.Join(t.TempDir(), "session.json"), lease)
+		c, err := New(server.URL, filepath.Join(t.TempDir(), "session.json"), "test", lease)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -139,7 +177,7 @@ func TestRedirectsAndRetriesEachConsumeBudget(t *testing.T) {
 		}))
 		defer server.Close()
 		lease := testLease(t, t.TempDir(), server.URL)
-		c, err := New(server.URL, filepath.Join(t.TempDir(), "session.json"), lease)
+		c, err := New(server.URL, filepath.Join(t.TempDir(), "session.json"), "test", lease)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -151,4 +189,64 @@ func TestRedirectsAndRetriesEachConsumeBudget(t *testing.T) {
 			t.Fatalf("requests=%d count=%d err=%v", requests, count, err)
 		}
 	})
+}
+
+func TestClientRejectsForeignTargetsAndRedirectsBeforeForwardingCookies(t *testing.T) {
+	var foreignRequests int
+	foreign := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { foreignRequests++ }))
+	defer foreign.Close()
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: "secret", Path: "/"})
+		http.Redirect(w, r, foreign.URL+"/capture", http.StatusFound)
+	}))
+	defer portal.Close()
+	c, err := New(portal.URL, filepath.Join(t.TempDir(), "session.json"), "test", testLease(t, t.TempDir(), portal.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Get(context.Background(), foreign.URL+"/direct"); err == nil {
+		t.Fatal("foreign initial target accepted")
+	}
+	if _, err := c.Get(context.Background(), "/redirect"); err == nil {
+		t.Fatal("foreign redirect accepted")
+	}
+	if foreignRequests != 0 {
+		t.Fatalf("foreign requests=%d", foreignRequests)
+	}
+}
+
+func TestLoginRequiresFreshCredentialsAndRecognizedProtectedPage(t *testing.T) {
+	var oldCookieForwarded bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := r.Cookie("old"); err == nil {
+			oldCookieForwarded = true
+		}
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, `<input name="_token" value="csrf">`)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "new", Value: "session", Path: "/"})
+		http.Redirect(w, r, "/", http.StatusFound)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `<h1>maintenance</h1>`) })
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "session.json")
+	jar, _ := newJar()
+	base := mustURL(t, server.URL)
+	jar.SetCookies(base, []*http.Cookie{{Name: "old", Value: "account-a", Path: "/"}})
+	if err := saveJar(path, jar, base, "test"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(server.URL, path, "test", testLease(t, t.TempDir(), server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Login(context.Background(), "account-b", "password"); err == nil {
+		t.Fatal("maintenance page accepted")
+	}
+	if oldCookieForwarded {
+		t.Fatal("old session cookie forwarded during explicit login")
+	}
 }

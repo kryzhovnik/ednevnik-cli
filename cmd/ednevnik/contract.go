@@ -14,6 +14,7 @@ import (
 	"github.com/kryzhovnik/ednevnik/internal/checkstate"
 	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/coordination"
+	"github.com/kryzhovnik/ednevnik/internal/credentials"
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
@@ -515,6 +516,10 @@ func hasTimelineOverlap(a, b []string) bool {
 }
 
 func liveReadFailure(err error) error {
+	var credentialErr *credentials.Error
+	if errors.As(err, &credentialErr) {
+		return &checkFailure{Reason: credentialErr.Code, Err: credentialErr, Action: "Correct the selected credential provider without falling back to another source."}
+	}
 	if errors.Is(err, client.ErrResponseTooLarge) {
 		return &checkFailure{Reason: model.ReasonInvalidSource, Err: errors.New("portal response exceeded the size limit"), Action: "Keep the last successful baseline and inspect the failing coverage before retrying."}
 	}

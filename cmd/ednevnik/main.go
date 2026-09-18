@@ -32,23 +32,21 @@ import (
 const version = "0.1.0-dev"
 
 type app struct {
-	client     siteClient
-	dir        string
-	creds      credentialStore
-	checker    checkRunner
-	origin     string
-	configDir  string
-	lease      *coordination.Lease
-	legacyDir  string
-	accountDir string
+	client      siteClient
+	dir         string
+	creds       credentials.Provider
+	checker     checkRunner
+	origin      string
+	configDir   string
+	lease       *coordination.Lease
+	legacyDir   string
+	accountDir  string
+	profile     string
+	authTried   bool
+	requireAuth bool
 }
 
 var errUnboundLegacyState = errors.New("unbound schema-v2 state requires explicit migration")
-
-type credentialStore interface {
-	PromptSave(string) error
-	Load() (string, string, error)
-}
 
 type siteClient interface {
 	Login(context.Context, string, string) error
@@ -102,8 +100,20 @@ func classifyOperationalError(err error) *commandError {
 	if errors.Is(err, coordination.ErrLockTimeout) {
 		return newContractError("", model.ReasonConcurrency, err, true, "Retry after the other account command finishes.", 1)
 	}
+	if errors.Is(err, client.ErrInvalidSession) {
+		return newContractError("", model.ReasonInvalidState, err, false, "Run session-reset and perform a fresh explicit login; diary history is preserved.", 1)
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return newContractError("", model.ReasonCancelled, err, true, "Retry as a new command after the cancellation or deadline condition is resolved.", 1)
+	}
+	if errors.Is(err, client.ErrOriginMismatch) {
+		return newContractError("", "origin_mismatch", err, false, "Use only targets on the configured portal origin.", 1)
+	}
+	if errors.Is(err, client.ErrAuthRejected) {
+		return newContractError("", "auth_rejected", err, false, "Correct the selected credentials; they are not retried automatically.", 1)
+	}
+	if errors.Is(err, client.ErrAuthInteractionRequired) {
+		return newContractError("", "auth_interaction_required", err, false, "Complete the supported password login manually; eID, MFA, CAPTCHA, and browser flows are not automated.", 1)
 	}
 	var httpErr *client.HTTPError
 	if errors.As(err, &httpErr) {
@@ -116,6 +126,10 @@ func classifyOperationalError(err error) *commandError {
 		if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden {
 			return newContractError("", model.ReasonAuthenticationProvider, err, false, "Authenticate the selected account once; do not retry rejected credentials automatically.", 1)
 		}
+	}
+	var credentialErr *credentials.Error
+	if errors.As(err, &credentialErr) {
+		return newContractError("", credentialErr.Code, credentialErr, false, "Correct the selected credential provider without falling back to another source.", 1)
 	}
 	return nil
 }
@@ -158,6 +172,12 @@ func run(ctx context.Context, args []string) error {
 		dir = testRoot
 	}
 	stateDir := envOr("EDNEVNIK_STATE_DIR", dir)
+	if testLoopback {
+		stateDir = envOr("EDNEVNIK_TEST_STATE_DIR", dir)
+		if !filepath.IsAbs(stateDir) {
+			return newContractError("", model.ReasonInvalidArgument, errors.New("loopback test state directory must be absolute"), false, "Set EDNEVNIK_TEST_STATE_DIR to an isolated temporary directory.", 2)
+		}
+	}
 	baseURL := envOr("EDNEVNIK_BASE_URL", client.DefaultBaseURL)
 	origin, err := validateConfiguredOrigin(baseURL, testLoopback)
 	if err != nil {
@@ -198,18 +218,46 @@ func run(ctx context.Context, args []string) error {
 		}
 		return local.changes(args[1:])
 	}
-	c, err := client.New(baseURL, filepath.Join(coordinator.StateDir(), "session.json"), lease)
+	sessionPath := filepath.Join(coordinator.StateDir(), "session.json")
+	if args[0] == "session-reset" {
+		if err := client.ResetSessionFile(sessionPath); err != nil {
+			return fmt.Errorf("reset session: %w", err)
+		}
+		fmt.Println("Local session reset. Diary history and unread events were preserved; remote sessions were not revoked.")
+		return nil
+	}
+	var c *client.Client
+	if args[0] == "login" {
+		c, err = client.NewFresh(origin, sessionPath, profile, lease)
+	} else {
+		c, err = client.New(origin, sessionPath, profile, lease)
+	}
 	if err != nil {
 		return err
 	}
-	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}, origin: origin, configDir: dir, lease: lease, legacyDir: filepath.Join(coordinator.StateDir(), "schema-v2"), accountDir: coordinator.StateDir()}
-	if testLoopback {
-		a.creds = nil
+	a := &app{client: c, dir: stateDir, origin: origin, profile: profile, configDir: dir, lease: lease, legacyDir: filepath.Join(coordinator.StateDir(), "schema-v2"), accountDir: coordinator.StateDir()}
+	providerName := os.Getenv("EDNEVNIK_CREDENTIAL_PROVIDER")
+	if providerName != "" && args[0] != "login" {
+		provider, providerErr := selectedProvider(providerName, profile, origin, testLoopback, false)
+		if providerErr != nil {
+			return providerErr
+		}
+		cached := credentials.NewCached(provider)
+		selected, loadErr := cached.Load(ctx)
+		if loadErr != nil {
+			return loadErr
+		}
+		bound, bindErr := a.validateCredentialAccount(selected.Username)
+		if bindErr != nil {
+			return bindErr
+		}
+		a.creds = cached
+		a.requireAuth = !bound
 	}
 
 	switch args[0] {
 	case "login":
-		return a.login(ctx, args[1:])
+		return a.login(ctx, profile, testLoopback, args[1:])
 	case "students":
 		return a.students(ctx)
 	case "subjects":
@@ -225,9 +273,6 @@ func run(ctx context.Context, args []string) error {
 	case "sync":
 		return a.sync(ctx, args[1:])
 	case "check":
-		// Check is noninteractive. Credential-provider selection is added by the
-		// authentication slice; this staged command never invokes Keychain.
-		a.creds = nil
 		return a.check(ctx, args[1:])
 	default:
 		return newContractError("", "invalid_argument", fmt.Errorf("unknown command %q", args[0]), false, "Choose a command shown in help.", 2)
@@ -243,34 +288,48 @@ func isLoopbackOrigin(raw string) bool {
 	return u.Hostname() == "localhost" || (ip != nil && ip.IsLoopback())
 }
 
-func (a *app) login(ctx context.Context, args []string) error {
+func (a *app) login(ctx context.Context, profile string, testLoopback bool, args []string) error {
 	fs := commandFlagSet("login")
 	save := fs.Bool("save", false, "save credentials in macOS Keychain for automatic re-login")
+	interactive := fs.Bool("interactive", false, "allow terminal prompts for this foreground login")
+	providerName := fs.String("provider", os.Getenv("EDNEVNIK_CREDENTIAL_PROVIDER"), "credential provider: env, file, or keychain")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	username := os.Getenv("EDNEVNIK_USERNAME")
-	password := os.Getenv("EDNEVNIK_PASSWORD")
+	if *save {
+		return &credentials.Error{Code: "credential_unavailable", Err: errors.New("safe Keychain saving is unsupported; add the exact item in Keychain Access, then use --provider keychain --interactive")}
+	}
+	if *providerName != "" {
+		allowInteractive := *interactive && term.IsTerminal(int(syscall.Stdin))
+		provider, err := selectedProvider(*providerName, profile, a.origin, testLoopback, allowInteractive)
+		if err != nil {
+			return err
+		}
+		credential, err := provider.Load(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := a.validateCredentialAccount(credential.Username); err != nil {
+			return err
+		}
+		if err := a.loginAndBind(ctx, credential); err != nil {
+			return err
+		}
+		fmt.Println("Login successful. Session saved locally with mode 0600.")
+		return nil
+	}
+	username := ""
+	password := ""
+	if !*interactive || !term.IsTerminal(int(syscall.Stdin)) {
+		return &credentials.Error{Code: "credential_unavailable", Err: errors.New("interactive login requires --interactive and a terminal; select file or env for unattended use")}
+	}
 	reader := bufio.NewReader(os.Stdin)
 	if username == "" {
 		fmt.Fprint(os.Stderr, "Username: ")
 		username, _ = reader.ReadString('\n')
 		username = strings.TrimSpace(username)
 	}
-	if *save && password == "" {
-		if a.creds == nil {
-			return errors.New("credential storage is unavailable")
-		}
-		fmt.Fprintln(os.Stderr, "Password will be stored in macOS Keychain.")
-		if err := a.creds.PromptSave(username); err != nil {
-			return fmt.Errorf("save credentials: %w", err)
-		}
-		storedUsername, storedPassword, err := a.creds.Load()
-		if err != nil {
-			return err
-		}
-		username, password = storedUsername, storedPassword
-	} else if password == "" {
+	if password == "" {
 		fmt.Fprint(os.Stderr, "Password: ")
 		b, err := term.ReadPassword(int(syscall.Stdin))
 		fmt.Fprintln(os.Stderr)
@@ -282,30 +341,146 @@ func (a *app) login(ctx context.Context, args []string) error {
 	if username == "" || password == "" {
 		return errors.New("username and password are required")
 	}
-	if err := a.client.Login(ctx, username, password); err != nil {
+	if _, err := a.validateCredentialAccount(username); err != nil {
 		return err
 	}
-	if *save && os.Getenv("EDNEVNIK_PASSWORD") != "" {
-		return errors.New("cannot save EDNEVNIK_PASSWORD securely; unset it and run interactively")
+	if err := a.loginAndBind(ctx, credentials.Credential{Username: username, Password: []byte(password)}); err != nil {
+		return err
 	}
 	fmt.Println("Login successful. Session saved locally with mode 0600.")
 	return nil
 }
 
 func (a *app) get(ctx context.Context, path string) ([]byte, error) {
+	if a.requireAuth && a.creds != nil {
+		a.authTried = true
+		credential, err := a.creds.Load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := a.loginAndBind(ctx, credential); err != nil {
+			return nil, fmt.Errorf("automatic login: %w", err)
+		}
+		a.requireAuth = false
+		return a.client.Get(ctx, path)
+	}
 	body, err := a.client.Get(ctx, path)
 	if !errors.Is(err, client.ErrNotAuthenticated) || a.creds == nil {
 		return body, err
 	}
-	username, password, loadErr := a.creds.Load()
+	if a.authTried {
+		return nil, client.ErrNotAuthenticated
+	}
+	a.authTried = true
+	credential, loadErr := a.creds.Load(ctx)
 	if loadErr != nil {
 		return nil, loadErr
 	}
-	if loginErr := a.client.Login(ctx, username, password); loginErr != nil {
+	if _, bindErr := a.validateCredentialAccount(credential.Username); bindErr != nil {
+		return nil, bindErr
+	}
+	if loginErr := a.loginAndBind(ctx, credential); loginErr != nil {
 		return nil, fmt.Errorf("automatic login: %w", loginErr)
 	}
 	return a.client.Get(ctx, path)
 }
+
+type accountBinding struct {
+	SchemaVersion int    `json:"schema_version"`
+	Profile       string `json:"profile"`
+	Origin        string `json:"origin"`
+	Username      string `json:"username"`
+}
+
+func (a *app) validateCredentialAccount(username string) (bool, error) {
+	if a.accountDir == "" {
+		return true, nil
+	}
+	path := filepath.Join(a.accountDir, "account.json")
+	var existing accountBinding
+	err := store.LoadSnapshot(path, &existing)
+	if err == nil {
+		if existing.SchemaVersion != 1 || existing.Profile != a.profile || existing.Origin != a.origin || existing.Username != username {
+			return false, &credentials.Error{Code: "credential_account_mismatch", Err: errors.New("selected credentials do not match the account bound to this profile and origin; use a different profile")}
+		}
+		return true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("load account binding: %w", err)
+	}
+	state, stateErr := a.checkStateStore(a.profile).Load(checkProfile{ID: a.profile, Origin: a.origin})
+	if stateErr == nil {
+		if len(state.Baselines) != 0 || len(state.Events) != 0 || state.LastSuccess != nil {
+			return false, &credentials.Error{Code: "credential_account_unbound", Err: errors.New("existing diary history has no credential account binding; use a new profile or migrate it explicitly")}
+		}
+	} else if !errors.Is(stateErr, checkstate.ErrAbsent) {
+		return false, stateErr
+	}
+	return false, nil
+}
+
+func (a *app) commitCredentialAccount(username string) error {
+	if a.accountDir == "" {
+		return nil
+	}
+	return store.SaveSnapshot(filepath.Join(a.accountDir, "account.json"), accountBinding{1, a.profile, a.origin, username})
+}
+
+func (a *app) loginAndBind(ctx context.Context, credential credentials.Credential) error {
+	commit := func() error { return a.commitCredentialAccount(credential.Username) }
+	if c, ok := a.client.(interface {
+		LoginWithCommit(context.Context, string, string, func() error) error
+	}); ok {
+		return c.LoginWithCommit(ctx, credential.Username, string(credential.Password), commit)
+	}
+	if err := a.client.Login(ctx, credential.Username, string(credential.Password)); err != nil {
+		return err
+	}
+	return commit()
+}
+
+func selectedProvider(name, profile, origin string, testLoopback, interactive bool) (credentials.Provider, error) {
+	if testLoopback {
+		if os.Getenv("EDNEVNIK_USERNAME") != "" || os.Getenv("EDNEVNIK_PASSWORD") != "" || os.Getenv("EDNEVNIK_CREDENTIALS_FILE") != "" {
+			return nil, errors.New("loopback test transport refuses production credential variables")
+		}
+		switch name {
+		case "env":
+			if os.Getenv("EDNEVNIK_TEST_CREDENTIALS_FILE") != "" {
+				return nil, &credentials.Error{Code: "credential_conflict", Err: errors.New("env and file credential input are both configured")}
+			}
+			return credentials.Environment{UsernameVar: "EDNEVNIK_TEST_USERNAME", PasswordVar: "EDNEVNIK_TEST_PASSWORD"}, nil
+		case "file":
+			if os.Getenv("EDNEVNIK_TEST_USERNAME") != "" || os.Getenv("EDNEVNIK_TEST_PASSWORD") != "" {
+				return nil, &credentials.Error{Code: "credential_conflict", Err: errors.New("file and env credential input are both configured")}
+			}
+			return credentials.File{Path: os.Getenv("EDNEVNIK_TEST_CREDENTIALS_FILE"), Account: profile, Origin: origin}, nil
+		default:
+			return nil, errors.New("loopback test transport supports only synthetic env or file credentials")
+		}
+	}
+	switch name {
+	case "env":
+		if os.Getenv("EDNEVNIK_CREDENTIALS_FILE") != "" {
+			return nil, &credentials.Error{Code: "credential_conflict", Err: errors.New("env and file credential input are both configured")}
+		}
+		return credentials.Environment{UsernameVar: "EDNEVNIK_USERNAME", PasswordVar: "EDNEVNIK_PASSWORD"}, nil
+	case "file":
+		if os.Getenv("EDNEVNIK_USERNAME") != "" || os.Getenv("EDNEVNIK_PASSWORD") != "" {
+			return nil, &credentials.Error{Code: "credential_conflict", Err: errors.New("file and env credential input are both configured")}
+		}
+		return credentials.File{Path: os.Getenv("EDNEVNIK_CREDENTIALS_FILE"), Account: profile, Origin: origin}, nil
+	case "keychain":
+		if !interactive {
+			return nil, &credentials.Error{Code: "credential_unavailable", Err: errors.New("unattended Keychain lookup is unsupported; select file or env")}
+		}
+		return credentials.Keychain{Account: os.Getenv("EDNEVNIK_USERNAME"), Service: keychainService(profile, origin), Interactive: true}, nil
+	default:
+		return nil, errors.New("credential provider must be one of env, file, or keychain")
+	}
+}
+
+func keychainService(profile, origin string) string { return "ednevnik-cli:" + profile + ":" + origin }
 
 func (a *app) students(ctx context.Context) error {
 	body, err := a.get(ctx, "/")
@@ -841,7 +1016,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `ednevnik - read structured data from moj.esdnevnik.rs
 
 Usage:
-  ednevnik login [--save]
+  ednevnik login [--provider env|file|keychain] [--interactive] [--save]
+  ednevnik session-reset
   ednevnik students
   ednevnik subjects --student ID
   ednevnik grades --student ID

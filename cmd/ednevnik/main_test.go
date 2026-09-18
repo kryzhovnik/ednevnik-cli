@@ -21,6 +21,7 @@ import (
 	"github.com/kryzhovnik/ednevnik/internal/checkstate"
 	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/coordination"
+	"github.com/kryzhovnik/ednevnik/internal/credentials"
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
@@ -366,6 +367,120 @@ func TestProcessErrorsAreJSONOnly(t *testing.T) {
 	}
 }
 
+func TestRealCLIUnattendedLoginAndPersistedRead(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	var submissions int
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login":
+			if r.Method == http.MethodGet {
+				_, _ = io.WriteString(w, `<input name="_token" value="csrf">`)
+				return
+			}
+			submissions++
+			if err := r.ParseForm(); err != nil || r.Form.Get("username") != "synthetic" || r.Form.Get("password") != " pass with edges " {
+				http.Error(w, "rejected", http.StatusUnauthorized)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: "synthetic", Path: "/", HttpOnly: true})
+			http.Redirect(w, r, "/", http.StatusFound)
+		case "/":
+			cookie, err := r.Cookie("session")
+			if err != nil || cookie.Value != "synthetic" {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+			_, _ = io.WriteString(w, `<div class="students-list"><div class="card student"><div class="card-header"><h5>Child</h5></div><a class="student-school-class-wrap active" href="/?student=1234567"><div class="student-school-class-item">School</div><div class="student-school-class-item school-class-strong">VII b</div><div class="student-school-class-item">26/27</div></a></div></div>`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer portal.Close()
+	root := t.TempDir()
+	productionState := t.TempDir()
+	baseEnv := append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+root, "EDNEVNIK_TEST_STATE_DIR="+root, "EDNEVNIK_STATE_DIR="+productionState, "EDNEVNIK_BASE_URL="+portal.URL, "EDNEVNIK_PROFILE=family", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_USERNAME=", "EDNEVNIK_PASSWORD=", "EDNEVNIK_CREDENTIALS_FILE=")
+	wrong := exec.Command(binary, "login", "--provider", "env")
+	wrong.Env = append(baseEnv, "EDNEVNIK_TEST_USERNAME=typo", "EDNEVNIK_TEST_PASSWORD=wrong")
+	if err := wrong.Run(); err == nil {
+		t.Fatal("rejected login succeeded")
+	}
+	coord, err := coordination.New(root, coordination.Namespace{Profile: "family", Origin: canonicalOrigin(portal.URL)}, coordination.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(coord.StateDir(), "account.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed login wrote account binding: %v", err)
+	}
+	login := exec.Command(binary, "login", "--provider", "env")
+	login.Env = append(baseEnv, "EDNEVNIK_TEST_USERNAME=synthetic", "EDNEVNIK_TEST_PASSWORD= pass with edges ")
+	if output, err := login.CombinedOutput(); err != nil {
+		t.Fatalf("login: %v %q", err, output)
+	}
+	read := exec.Command(binary, "students")
+	read.Env = baseEnv
+	output, err := read.CombinedOutput()
+	if err != nil || !bytes.Contains(output, []byte(`"id": "1234567"`)) || submissions != 2 {
+		t.Fatalf("read: %v submissions=%d output=%q", err, submissions, output)
+	}
+	if entries, err := os.ReadDir(productionState); err != nil || len(entries) != 0 {
+		t.Fatalf("production state touched: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestRealCLIFailedAuthCheckThenProviderRecovery(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v %s", err, output)
+	}
+	var submissions int
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			if r.Method == http.MethodGet {
+				_, _ = io.WriteString(w, `<form action="/login"><input name="_token" value="csrf"><input name="password"></form>`)
+				return
+			}
+			submissions++
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: "ok", Path: "/"})
+			http.Redirect(w, r, "/", http.StatusFound)
+			return
+		}
+		if cookie, err := r.Cookie("session"); err != nil || cookie.Value != "ok" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<div class="students-list"></div>`)
+		case "/grades":
+			_, _ = io.WriteString(w, `<div class="flex-table"></div>`)
+		case "/absents":
+			_, _ = io.WriteString(w, `<div class="categories-wrap"></div>`)
+		case "/timeline-data":
+			_, _ = io.WriteString(w, `{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer portal.Close()
+	root := t.TempDir()
+	common := append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+root, "EDNEVNIK_TEST_STATE_DIR="+root, "EDNEVNIK_BASE_URL="+portal.URL, "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_MIN_CHECK_INTERVAL=0s")
+	first := exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
+	first.Env = common
+	if err := first.Run(); err == nil {
+		t.Fatal("unauthenticated check succeeded")
+	}
+	second := exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
+	second.Env = append(common, "EDNEVNIK_CREDENTIAL_PROVIDER=env", "EDNEVNIK_TEST_USERNAME=synthetic", "EDNEVNIK_TEST_PASSWORD=password")
+	output, err := second.CombinedOutput()
+	if err != nil || !bytes.Contains(output, []byte(`"outcome": "initial_baseline"`)) || submissions != 1 {
+		t.Fatalf("recovery err=%v submissions=%d output=%q", err, submissions, output)
+	}
+}
+
 func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "ednevnik")
 	build := exec.Command("go", "build", "-o", binary, ".")
@@ -413,7 +528,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 
 	cmd := exec.Command(binary, "check", "--profile=family", "--student", "1234567")
-	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
@@ -430,7 +545,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			c := exec.Command(binary, "check", "--force", "--profile=family", "--student", "1234567")
-			c.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+configDir, "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+			c.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+configDir, "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 			concurrentErrs <- c.Run()
 		}()
 	}
@@ -441,7 +556,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 	portalMode.Store("empty-grades")
 	cmd = exec.Command(binary, "grades", "--student", "1234567")
-	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 	stdout.Reset()
 	stderr.Reset()
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -467,7 +582,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	for _, mode := range []string{"maintenance", "success-only", "oversized"} {
 		portalMode.Store(mode)
 		cmd = exec.Command(binary, "check", "--force", "--profile", "family", "--student", "1234567")
-		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 		stdout.Reset()
 		stderr.Reset()
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -486,7 +601,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 	portalMode.Store("maintenance")
 	cmd = exec.Command(binary, "subjects", "--student", "1234567")
-	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 	stdout.Reset()
 	stderr.Reset()
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -578,7 +693,7 @@ func TestProcessSuccessiveAbsenceCorrectionsRetainDistinctTransitions(t *testing
 			args = append(args, "--force")
 		}
 		cmd := exec.Command(binary, args...)
-		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil {
@@ -673,7 +788,7 @@ func TestProcessStableAbsenceReappearanceContinuesIdentity(t *testing.T) {
 			args = append(args, "--force")
 		}
 		cmd := exec.Command(binary, args...)
-		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil {
@@ -752,7 +867,7 @@ func TestConcurrentCLIProcessesShareAccountRequestPolicy(t *testing.T) {
 	stateDir := t.TempDir()
 	newCommand := func(profile string) *exec.Cmd {
 		cmd := exec.Command(binary, "page", "--path", "/synthetic")
-		cmd.Env = append(os.Environ(), "EDNEVNIK_PROFILE="+profile, "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL, "EDNEVNIK_REQUEST_INTERVAL=100ms")
+		cmd.Env = append(os.Environ(), "EDNEVNIK_PROFILE="+profile, "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL, "EDNEVNIK_REQUEST_INTERVAL=100ms")
 		return cmd
 	}
 	first, second := newCommand("family"), newCommand("family")
@@ -858,8 +973,9 @@ func (f *retryClient) Get(context.Context, string) ([]byte, error) {
 
 type fakeCredentials struct{}
 
-func (fakeCredentials) PromptSave(string) error       { return nil }
-func (fakeCredentials) Load() (string, string, error) { return "user", "password", nil }
+func (fakeCredentials) Load(context.Context) (credentials.Credential, error) {
+	return credentials.Credential{Username: "user", Password: []byte("password")}, nil
+}
 
 func TestGetAutomaticallyLogsInAndRetries(t *testing.T) {
 	fake := &retryClient{}
@@ -870,6 +986,67 @@ func TestGetAutomaticallyLogsInAndRetries(t *testing.T) {
 	}
 	if string(body) != "ok" || fake.gets != 2 || fake.logins != 1 {
 		t.Fatalf("body=%q gets=%d logins=%d", body, fake.gets, fake.logins)
+	}
+}
+
+func TestRecoveryUsesCredentialsOnceAndAccountBindingSurvivesReset(t *testing.T) {
+	dir := t.TempDir()
+	fake := &retryClient{}
+	a := &app{client: fake, creds: fakeCredentials{}, accountDir: dir, profile: "family", origin: "https://portal.example"}
+	if _, err := a.get(context.Background(), "/grades"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.gets != 2 || fake.logins != 1 {
+		t.Fatalf("gets=%d logins=%d", fake.gets, fake.logins)
+	}
+	if _, err := a.validateCredentialAccount("other-user"); err == nil {
+		t.Fatal("account switch in same profile accepted")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "session.json"), []byte("session"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "history.json"), []byte("history"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ResetSessionFile(filepath.Join(dir, "session.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "account.json")); err != nil {
+		t.Fatalf("account binding removed: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(dir, "history.json")); err != nil || string(body) != "history" {
+		t.Fatalf("history=%q err=%v", body, err)
+	}
+}
+
+func TestRecoveryDoesNotTryCredentialsTwice(t *testing.T) {
+	fake := &retryClient{}
+	a := &app{client: fake, creds: fakeCredentials{}}
+	if _, err := a.get(context.Background(), "/first"); err != nil {
+		t.Fatal(err)
+	}
+	fake.gets = 0
+	if _, err := a.get(context.Background(), "/second"); !errors.Is(err, client.ErrNotAuthenticated) {
+		t.Fatalf("error=%v", err)
+	}
+	if fake.logins != 1 {
+		t.Fatalf("logins=%d", fake.logins)
+	}
+}
+
+func TestCredentialProviderConflictAndCheckErrorReason(t *testing.T) {
+	t.Setenv("EDNEVNIK_USERNAME", "parent")
+	t.Setenv("EDNEVNIK_PASSWORD", "secret")
+	t.Setenv("EDNEVNIK_CREDENTIALS_FILE", "/private/credential")
+	_, err := selectedProvider("env", "family", "https://portal.example", false, false)
+	var providerErr *credentials.Error
+	if !errors.As(err, &providerErr) || providerErr.Code != "credential_conflict" {
+		t.Fatalf("error=%v", err)
+	}
+	failure := liveReadFailure(&credentials.Error{Code: "credential_missing", Err: errors.New("missing")})
+	var checkErr *checkFailure
+	if !errors.As(failure, &checkErr) || checkErr.Reason != "credential_missing" {
+		t.Fatalf("failure=%v", failure)
 	}
 }
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,12 +12,18 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	jarengine "github.com/kryzhovnik/ednevnik/internal/client/cookiejar"
 	"github.com/kryzhovnik/ednevnik/internal/coordination"
 )
 
 const DefaultBaseURL = "https://moj.esdnevnik.rs"
 
-var ErrNotAuthenticated = errors.New("not authenticated; run `ednevnik login`")
+var (
+	ErrNotAuthenticated        = errors.New("not authenticated; run `ednevnik login`")
+	ErrOriginMismatch          = errors.New("request target is outside the configured portal origin")
+	ErrAuthRejected            = errors.New("credentials were rejected")
+	ErrAuthInteractionRequired = errors.New("interactive authentication is required")
+)
 
 type HTTPError struct {
 	StatusCode int
@@ -31,37 +37,81 @@ type Client struct {
 	http        *http.Client
 	lease       *coordination.Lease
 	sessionPath string
+	account     string
 	userAgent   string
 }
 
-func New(baseURL, sessionPath string, lease *coordination.Lease) (*Client, error) {
+func New(baseURL, sessionPath, account string, lease *coordination.Lease) (*Client, error) {
+	return newClientWithMode(baseURL, sessionPath, account, lease, http.DefaultTransport, false)
+}
+
+func newClient(baseURL, sessionPath, account string, lease *coordination.Lease, roundTripper http.RoundTripper) (*Client, error) {
+	return newClientWithMode(baseURL, sessionPath, account, lease, roundTripper, false)
+}
+
+func NewFresh(baseURL, sessionPath, account string, lease *coordination.Lease) (*Client, error) {
+	return newClientWithMode(baseURL, sessionPath, account, lease, http.DefaultTransport, true)
+}
+
+func newClientWithMode(baseURL, sessionPath, account string, lease *coordination.Lease, roundTripper http.RoundTripper, fresh bool) (*Client, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
 	}
-	jar, err := loadJar(sessionPath, base)
+	if base.User != nil || base.Hostname() == "" || base.Path != "" || base.RawQuery != "" || base.Fragment != "" || (base.Scheme != "https" && !(base.Scheme == "http" && isLoopbackHost(base.Hostname()))) {
+		return nil, errors.New("client base URL must be an exact HTTPS origin")
+	}
+	if account == "" {
+		return nil, errors.New("client requires an explicit account")
+	}
+	var jar *jarengine.Jar
+	if fresh {
+		jar, err = newJar()
+	} else {
+		jar, err = loadJar(sessionPath, base, account)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load session: %w", err)
 	}
 	if lease == nil {
 		return nil, errors.New("client requires an account coordination lease")
 	}
-	transport := &policyTransport{base: http.DefaultTransport, lease: lease}
-	return &Client{
+	transport := &policyTransport{base: roundTripper, lease: lease}
+	c := &Client{
 		base:  base,
 		http:  &http.Client{Jar: jar, Timeout: 30 * time.Second, Transport: transport},
 		lease: lease, sessionPath: sessionPath,
+		account:   account,
 		userAgent: "ednevnik-cli/0.1 (+https://github.com/kryzhovnik/ednevnik)",
-	}, nil
+	}
+	c.http.CheckRedirect = c.checkRedirect
+	return c, nil
+}
+
+func isLoopbackHost(host string) bool {
+	ip := net.ParseIP(host)
+	return host == "localhost" || (ip != nil && ip.IsLoopback())
 }
 
 func (c *Client) Login(ctx context.Context, username, password string) error {
+	return c.LoginWithCommit(ctx, username, password, nil)
+}
+
+// LoginWithCommit verifies the selected credentials, runs commit before the
+// new cookie snapshot becomes durable, and then saves the session.
+func (c *Client) LoginWithCommit(ctx context.Context, username, password string, commit func() error) error {
+	jar, err := newJar()
+	if err != nil {
+		return err
+	}
+	// Explicit authentication never inherits a prior account's cookies.
+	c.http.Jar = jar
 	body, finalURL, err := c.get(ctx, "/login", false)
 	if err != nil {
 		return err
 	}
 	if finalURL.Path != "/login" {
-		return saveJar(c.sessionPath, c.http.Jar, c.base)
+		return fmt.Errorf("%w: login endpoint did not present the expected credential form", ErrAuthInteractionRequired)
 	}
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
 	if err != nil {
@@ -69,7 +119,7 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 	}
 	token, ok := doc.Find(`input[name="_token"]`).First().Attr("value")
 	if !ok || token == "" {
-		return errors.New("login form has no CSRF token; the site may have changed")
+		return fmt.Errorf("%w: login form has no CSRF token", ErrAuthInteractionRequired)
 	}
 	form := url.Values{"_token": {token}, "username": {username}, "password": {password}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base.ResolveReference(&url.URL{Path: "/login"}).String(), strings.NewReader(form.Encode()))
@@ -82,29 +132,53 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.Request.URL.Path == "/login" {
-		return errors.New("login failed; check the credentials and complete any required browser verification")
+	if _, err := readResponseBody(resp.Body); err != nil {
+		return err
 	}
-	return saveJar(c.sessionPath, c.http.Jar, c.base)
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		return &HTTPError{StatusCode: resp.StatusCode, RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return &HTTPError{StatusCode: resp.StatusCode}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || resp.Request.URL.Path == "/login" {
+		return ErrAuthRejected
+	}
+	verified, verifiedURL, err := c.get(ctx, "/", true)
+	if err != nil {
+		return fmt.Errorf("verify authenticated session: %w", err)
+	}
+	if verifiedURL.Path == "/login" || !authenticatedPage(verified) {
+		return ErrAuthInteractionRequired
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			return err
+		}
+	}
+	return saveJar(c.sessionPath, jar, c.base, c.account)
 }
 
 func (c *Client) Get(ctx context.Context, path string) ([]byte, error) {
 	body, finalURL, err := c.get(ctx, path, true)
+	jar, ok := c.http.Jar.(*jarengine.Jar)
+	if !ok {
+		return nil, errors.New("unsupported session jar")
+	}
+	if err := saveJar(c.sessionPath, jar, c.base, c.account); err != nil {
+		return nil, fmt.Errorf("save session: %w", err)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if finalURL.Path == "/login" {
 		return nil, ErrNotAuthenticated
 	}
-	if err := saveJar(c.sessionPath, c.http.Jar, c.base); err != nil {
-		return nil, fmt.Errorf("save session: %w", err)
-	}
 	return body, nil
 }
 
 func (c *Client) get(ctx context.Context, path string, authenticated bool) ([]byte, *url.URL, error) {
-	target, err := c.base.Parse(path)
+	target, err := c.resolveTarget(path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -150,6 +224,51 @@ func (c *Client) get(ctx context.Context, path string, authenticated bool) ([]by
 		return body, resp.Request.URL, nil
 	}
 	return nil, nil, lastErr
+}
+
+func (c *Client) resolveTarget(raw string) (*url.URL, error) {
+	target, err := c.base.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if target.User != nil || target.Scheme != c.base.Scheme || target.Host != c.base.Host {
+		return nil, ErrOriginMismatch
+	}
+	return target, nil
+}
+
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	if _, err := c.resolveTarget(req.URL.String()); err != nil {
+		return err
+	}
+	previous := via[len(via)-1]
+	if previous.Method != http.MethodGet && previous.Method != http.MethodHead && req.Method == previous.Method {
+		return errors.New("refusing redirect that repeats a credential-bearing request")
+	}
+	return nil
+}
+
+func authenticatedPage(body []byte) bool {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return false
+	}
+	if doc.Find(`form input[name="password"], form[action*="/login"] input[name="username"]`).Length() != 0 {
+		return false
+	}
+	return doc.Find(`.students-list, .card.student, timeline, a[href*="logout"]`).Length() != 0
+}
+
+func (c *Client) ResetSession() error {
+	jar, err := newJar()
+	if err != nil {
+		return err
+	}
+	c.http.Jar = jar
+	return resetSession(c.sessionPath)
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
