@@ -57,7 +57,11 @@ cancelled attempt successful.
 The current live adapter validates grade overview, current absences, and the
 newest timeline page through the real parsers. A valid empty grade overview
 still has the observed grade-table container, and a valid empty absence page
-still has the observed categories container. An arbitrary HTML page is not an
+still has the observed categories container. The container must have an
+explicit closing tag, so a known truncated empty prefix is invalid. When the
+page supplies a student-class identifier, it must match the requested
+enrolment; an otherwise recognized empty page can have no such identifier.
+An arbitrary HTML page is not an
 empty section. Subject links must identify the requested enrolment. Individual
 records need their essential identifiers and fields. Unknown assessment forms,
 unknown absence statuses, and inconsistent timeline pagination are

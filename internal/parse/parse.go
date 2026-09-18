@@ -10,21 +10,24 @@ import (
 	"html"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/kryzhovnik/ednevnik/internal/model"
+	xhtml "golang.org/x/net/html"
 )
 
 var (
 	ErrInvalidSource = errors.New("portal source is invalid or unsupported")
 
-	studentIDPattern = regexp.MustCompile(`[?&]student=(\d+)`)
-	subjectIDPattern = regexp.MustCompile(`/grades/(\d+)/show`)
-	yearPattern      = regexp.MustCompile(`\b(\d{2})/(\d{2})\b`)
-	classPattern     = regexp.MustCompile(`\b([IVX]+\s*[[:alpha:]А-Яа-я])\b`)
-	datePattern      = regexp.MustCompile(`\b\d{2}\s*\.\s*\d{2}\s*\.\s*\d{4}\s*\.`)
+	studentIDPattern  = regexp.MustCompile(`[?&]student=(\d+)`)
+	subjectIDPattern  = regexp.MustCompile(`/grades/(\d+)/show`)
+	yearPattern       = regexp.MustCompile(`\b(\d{2})/(\d{2})\b`)
+	classPattern      = regexp.MustCompile(`\b([IVX]+\s*[[:alpha:]А-Яа-я])\b`)
+	datePattern       = regexp.MustCompile(`\b\d{2}\s*\.\s*\d{2}\s*\.\s*\d{4}\s*\.`)
+	gradeValuePattern = regexp.MustCompile(`^[1-5]$`)
 )
 
 func invalidSource(message string) error { return fmt.Errorf("%w: %s", ErrInvalidSource, message) }
@@ -172,6 +175,11 @@ func Subjects(body []byte, expectedEnrolment ...string) ([]model.Subject, error)
 	var subjects []model.Subject
 	invalid := ""
 	recognized := doc.Find(`.flex-table, .grades-wrap, a[href*="/grades/"][href*="/show"]`).Length() > 0
+	if len(expectedEnrolment) > 0 && expectedEnrolment[0] != "" {
+		if err := validateSuppliedEnrolment(doc, expectedEnrolment[0], "grade overview"); err != nil {
+			return nil, err
+		}
+	}
 	doc.Find(`a[href*="/grades/"][href*="/show"]`).Each(func(_ int, s *goquery.Selection) {
 		href, _ := s.Attr("href")
 		m := subjectIDPattern.FindStringSubmatch(href)
@@ -188,7 +196,18 @@ func Subjects(body []byte, expectedEnrolment ...string) ([]model.Subject, error)
 		}
 		text := clean(s.Find("strong.d-block").First().Text())
 		teacher := clean(s.Find("em").First().Text())
-		displayedGrades := selectionTexts(s.Find(".grades-cell-wrap .grade.numeric"))
+		numericGrades := s.Find(".grades-cell-wrap .grade.numeric")
+		displayedGrades := selectionTexts(numericGrades)
+		if len(displayedGrades) != numericGrades.Length() {
+			invalid = "numeric grade overview contains an empty value"
+			return
+		}
+		for _, value := range displayedGrades {
+			if !gradeValuePattern.MatchString(value) {
+				invalid = "numeric grade overview contains an unsupported value"
+				return
+			}
+		}
 		if text == "" {
 			text = clean(s.Text())
 		}
@@ -213,6 +232,9 @@ func Subjects(body []byte, expectedEnrolment ...string) ([]model.Subject, error)
 	if !recognized {
 		return nil, invalidSource("grade overview structure was not recognized")
 	}
+	if len(subjects) == 0 && !hasClosedClassElement(body, "flex-table") && !hasClosedClassElement(body, "grades-wrap") {
+		return nil, invalidSource("empty grade overview container is incomplete")
+	}
 	return dedupeSubjects(subjects), nil
 }
 
@@ -222,7 +244,7 @@ func Grades(body []byte, studentID string, subject model.Subject) ([]model.Grade
 		return nil, err
 	}
 	grades := []model.Grade{}
-	if doc.Find(`.categories-wrap, [data-section="grade-details"], .category-item-wrap.grade`).Length() == 0 {
+	if doc.Find(`.categories-wrap, .category-item-wrap.grade`).Length() == 0 {
 		return nil, invalidSource("grade detail structure was not recognized")
 	}
 	if doc.Find(".category-item-wrap.grade:not(.numeric)").Length() > 0 {
@@ -231,7 +253,7 @@ func Grades(body []byte, studentID string, subject model.Subject) ([]model.Grade
 	invalid := ""
 	doc.Find(".category-item-wrap.grade.numeric").Each(func(_ int, item *goquery.Selection) {
 		value := clean(item.Find(".category-symbol").First().Clone().Children().Remove().End().Text())
-		if !regexp.MustCompile(`^[1-5]$`).MatchString(value) {
+		if !gradeValuePattern.MatchString(value) {
 			invalid = "numeric grade has an unsupported value"
 			return
 		}
@@ -257,21 +279,11 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 	if err != nil {
 		return nil, err
 	}
-	if doc.Find(`.categories-wrap, [data-section="absences"]`).Length() == 0 {
+	if doc.Find(`.categories-wrap`).Length() == 0 {
 		return nil, invalidSource("absence structure was not recognized")
 	}
-	for _, attribute := range []string{"data-student-class-id", ":student-class-id"} {
-		doc.Find("*").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-			value, _ := s.Attr(attribute)
-			if value != "" && value != studentID {
-				err = invalidSource("absence page identifies a different enrolment")
-				return false
-			}
-			return true
-		})
-		if err != nil {
-			return nil, err
-		}
+	if err := validateSuppliedEnrolment(doc, studentID, "absence page"); err != nil {
+		return nil, err
 	}
 	var out []model.Absence
 	invalid := ""
@@ -303,7 +315,61 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 	if invalid != "" {
 		return nil, invalidSource(invalid)
 	}
+	if len(out) == 0 && !hasClosedClassElement(body, "categories-wrap") {
+		return nil, invalidSource("empty absence container is incomplete")
+	}
 	return dedupeAbsences(out), nil
+}
+
+func validateSuppliedEnrolment(doc *goquery.Document, expected, section string) error {
+	for _, attribute := range []string{"data-student-class-id", ":student-class-id"} {
+		var mismatch bool
+		doc.Find("*").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+			value, _ := s.Attr(attribute)
+			if value != "" && value != expected {
+				mismatch = true
+				return false
+			}
+			return true
+		})
+		if mismatch {
+			return invalidSource(section + " identifies a different enrolment")
+		}
+	}
+	return nil
+}
+
+func hasClosedClassElement(body []byte, className string) bool {
+	tokenizer := xhtml.NewTokenizer(bytes.NewReader(body))
+	targetTag := ""
+	nestedTargets := 0
+	for {
+		switch tokenizer.Next() {
+		case xhtml.ErrorToken:
+			return false
+		case xhtml.StartTagToken:
+			token := tokenizer.Token()
+			if targetTag == "" {
+				for _, attr := range token.Attr {
+					if attr.Key == "class" && slices.Contains(strings.Fields(attr.Val), className) {
+						targetTag = token.Data
+						nestedTargets = 1
+						break
+					}
+				}
+			} else if token.Data == targetTag {
+				nestedTargets++
+			}
+		case xhtml.EndTagToken:
+			token := tokenizer.Token()
+			if targetTag != "" && token.Data == targetTag {
+				nestedTargets--
+				if nestedTargets == 0 {
+					return true
+				}
+			}
+		}
+	}
 }
 
 type timelineResponse struct {
@@ -353,8 +419,12 @@ func Timeline(body []byte, studentID string, expectedPage ...int) (model.Activit
 	if len(expectedPage) > 0 && raw.Meta.CurrentPage != expectedPage[0] {
 		return model.ActivityPage{}, invalidSource(fmt.Sprintf("timeline returned page %d for requested page %d", raw.Meta.CurrentPage, expectedPage[0]))
 	}
-	if raw.Meta.NextPage != nil && (*raw.Meta.NextPage <= raw.Meta.CurrentPage || *raw.Meta.NextPage > raw.Meta.LastPage) {
-		return model.ActivityPage{}, invalidSource("timeline next-page metadata is invalid")
+	if raw.Meta.CurrentPage < raw.Meta.LastPage {
+		if raw.Meta.NextPage == nil || *raw.Meta.NextPage != raw.Meta.CurrentPage+1 {
+			return model.ActivityPage{}, invalidSource("timeline next-page metadata is missing or non-sequential")
+		}
+	} else if raw.Meta.NextPage != nil {
+		return model.ActivityPage{}, invalidSource("final timeline page unexpectedly has a next page")
 	}
 	if len(raw.Data) == 0 || bytes.Equal(bytes.TrimSpace(raw.Data), []byte("null")) {
 		return model.ActivityPage{}, invalidSource("timeline data array is missing")

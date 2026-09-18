@@ -280,6 +280,10 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/grades":
+			if portalMode.Load() == "empty-grades" {
+				_, _ = w.Write([]byte(`<div class="flex-table"></div>`))
+				return
+			}
 			if portalMode.Load() == "maintenance" {
 				_, _ = w.Write([]byte(`<html><title>Maintenance</title></html>`))
 				return
@@ -323,6 +327,20 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &incomplete); err != nil || incomplete.Outcome != model.OutcomeIncomplete {
 		t.Fatalf("stdout=%q err=%v", stdout.String(), err)
 	}
+	portalMode.Store("empty-grades")
+	cmd = exec.Command(binary, "grades", "--student", "1234567")
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil || stderr.Len() != 0 {
+		t.Fatalf("valid empty grades err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	var emptyGrades model.StudentData
+	if err := json.Unmarshal(stdout.Bytes(), &emptyGrades); err != nil || len(emptyGrades.Subjects) != 0 || len(emptyGrades.Grades) != 0 {
+		t.Fatalf("empty grades stdout=%q err=%v", stdout.String(), err)
+	}
+	portalMode.Store("valid")
 
 	// Seed an earlier complete result and prove that source failures update only
 	// the latest attempt. The successful baseline remains available to status.

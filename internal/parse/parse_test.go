@@ -122,6 +122,23 @@ func TestSubjectsRequireRequestedEnrolmentEvidence(t *testing.T) {
 	}
 }
 
+func TestEmptySectionsRejectWrongEnrolmentAndTruncatedContainer(t *testing.T) {
+	wrong := []byte(`<div class="flex-table" data-student-class-id="9999999"></div>`)
+	if _, err := Subjects(wrong, "1234567"); err == nil {
+		t.Fatal("empty overview for another enrolment accepted")
+	}
+	wrong = []byte(`<div class="categories-wrap" data-student-class-id="9999999"></div>`)
+	if _, err := Absences(wrong, "1234567"); err == nil {
+		t.Fatal("empty absences for another enrolment accepted")
+	}
+	if _, err := Subjects([]byte(`<div class="flex-table">`), "1234567"); err == nil {
+		t.Fatal("truncated empty overview accepted")
+	}
+	if _, err := Absences([]byte(`<div class="categories-wrap">`), "1234567"); err == nil {
+		t.Fatal("truncated empty absences accepted")
+	}
+}
+
 func TestGenericPage(t *testing.T) {
 	p, err := GenericPage([]byte(`<html><head><title> Page </title></head><body><a href="/grades" aria-label="Grade activity detail"> Grades </a></body></html>`), "https://example.test")
 	if err != nil {
@@ -186,9 +203,21 @@ func TestTimelineRejectsSuccessWithoutCoverageMetadata(t *testing.T) {
 		[]byte(`{"success":true,"meta":{"currentPage":1,"lastPage":1},"data":[{"items":null}]}`),
 		[]byte(`{"success":true,"meta":{"currentPage":2,"lastPage":2},"data":[]}`),
 		[]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":1,"lastPage":2},"data":[]}`),
+		[]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":2},"data":[]}`),
+		[]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":3,"lastPage":3},"data":[]}`),
+		[]byte(`{"success":true,"meta":{"currentPage":2,"nextPage":3,"lastPage":2},"data":[]}`),
 	} {
 		if _, err := Timeline(body, "1234567", 1); err == nil {
 			t.Fatalf("invalid timeline accepted: %s", body)
+		}
+	}
+}
+
+func TestSubjectsRejectsInvalidNumericOverviewValue(t *testing.T) {
+	for _, value := range []string{"", "A", "6"} {
+		body := []byte(`<a href="/grades/7654321/show?student=1234567"><strong class="d-block">Math</strong><div class="grades-cell-wrap"><div class="grade numeric">` + value + `</div></div></a>`)
+		if _, err := Subjects(body, "1234567"); err == nil {
+			t.Fatalf("numeric overview value %q accepted", value)
 		}
 	}
 }
