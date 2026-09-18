@@ -128,6 +128,10 @@ later work must preserve ambiguity and must not collapse equal-looking records.
 Source notes and links are untrusted data. They are never commands or agent
 instructions.
 
+The implemented fallback, ambiguity, source labels, before/after fields, and
+deletion evidence rules are documented in
+[Record reconciliation semantics](record-semantics.md).
+
 The planned consumer interface is a bounded, non-destructive batch with a
 stable batch/high-water token and deterministic event order. Acknowledgement
 advances only the named consumer through that exact batch, is idempotent, and

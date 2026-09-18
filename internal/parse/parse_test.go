@@ -1,6 +1,7 @@
 package parse
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -173,6 +174,24 @@ func TestAbsences(t *testing.T) {
 	}
 	if items[1].Status != "excused" {
 		t.Fatalf("second = %#v", items[1])
+	}
+}
+
+func TestAbsencesPreserveEqualLookingRecordsAndSourceIdentity(t *testing.T) {
+	body := []byte(`<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap red" data-record-id="absence-1"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Math</div></div><div class="category-item-wrap red"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Math</div></div><div class="category-item-wrap red"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Math</div></div></div></div>`)
+	items, err := Absences(body, "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 || items[0].SourceID != "absence-1" || items[1].ID == items[2].ID {
+		t.Fatalf("items = %#v", items)
+	}
+}
+
+func TestAbsencesRejectDuplicateSourceIdentity(t *testing.T) {
+	body := []byte(`<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap red" data-record-id="same"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Math</div></div><div class="category-item-wrap green" data-record-id="same"><span class="category-symbol">3</span><span class="category-symbol-subtitle">hour</span><div class="name">Math</div></div></div></div>`)
+	if _, err := Absences(body, "123"); !errors.Is(err, ErrInvalidSource) {
+		t.Fatalf("error = %v", err)
 	}
 }
 

@@ -244,6 +244,7 @@ func Grades(body []byte, studentID string, subject model.Subject) ([]model.Grade
 		return nil, err
 	}
 	grades := []model.Grade{}
+	fallbackOrdinals := map[string]int{}
 	if doc.Find(`.categories-wrap, .category-item-wrap.grade`).Length() == 0 {
 		return nil, invalidSource("grade detail structure was not recognized")
 	}
@@ -268,14 +269,25 @@ func Grades(body []byte, studentID string, subject model.Subject) ([]model.Grade
 		}
 		kind := strings.TrimSpace(strings.TrimPrefix(clean(item.Find(".name-subtitle-suffix").First().Text()), "•"))
 		note := clean(item.Find(".category-item-bottom-note").First().Text())
-		id := stableID(studentID, subject.ID, value, date, kind, note)
-		grades = append(grades, model.Grade{ID: id, StudentID: studentID, SubjectID: subject.ID, Subject: subject.Name, Value: value, Kind: kind, Date: date, Note: note})
+		sourceID := sourceRecordID(item)
+		id := sourceID
+		fallbackOrdinal := 0
+		if id == "" {
+			anchor := strings.Join([]string{subject.ID, date, kind}, "\x00")
+			fallbackOrdinals[anchor]++
+			fallbackOrdinal = fallbackOrdinals[anchor]
+			id = stableID(studentID, anchor, fmt.Sprintf("%d", fallbackOrdinal))
+		}
+		grades = append(grades, model.Grade{ID: id, SourceID: sourceID, FallbackOrdinal: fallbackOrdinal, StudentID: studentID, SubjectID: subject.ID, Subject: subject.Name, Value: value, Kind: kind, Date: date, Note: note})
 	})
 	if invalid != "" {
 		return nil, invalidSource(invalid)
 	}
 	if len(grades) == 0 && !hasClosedClassElement(body, "categories-wrap") {
 		return nil, invalidSource("empty grade detail container is incomplete")
+	}
+	if duplicate := duplicateGradeSourceID(grades); duplicate != "" {
+		return nil, invalidSource("grade source identifier is duplicated")
 	}
 	return grades, nil
 }
@@ -292,6 +304,7 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 		return nil, err
 	}
 	var out []model.Absence
+	fallbackOrdinals := map[string]int{}
 	invalid := ""
 	doc.Find(".categories-wrap .category-item-wrap").Each(func(_ int, s *goquery.Selection) {
 		subject := clean(s.Find(".name").First().Text())
@@ -315,8 +328,16 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 			invalid = "absence record has an unsupported status"
 			return
 		}
-		id := stableID(studentID, subject, date, period, status, note)
-		out = append(out, model.Absence{ID: id, StudentID: studentID, Subject: subject, Date: date, Period: period, Status: status, Note: note})
+		sourceID := sourceRecordID(s)
+		id := sourceID
+		fallbackOrdinal := 0
+		if id == "" {
+			anchor := strings.Join([]string{subject, date, period}, "\x00")
+			fallbackOrdinals[anchor]++
+			fallbackOrdinal = fallbackOrdinals[anchor]
+			id = stableID(studentID, anchor, fmt.Sprintf("%d", fallbackOrdinal))
+		}
+		out = append(out, model.Absence{ID: id, SourceID: sourceID, FallbackOrdinal: fallbackOrdinal, StudentID: studentID, Subject: subject, Date: date, Period: period, Status: status, Note: note})
 	})
 	if invalid != "" {
 		return nil, invalidSource(invalid)
@@ -324,7 +345,47 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 	if len(out) == 0 && !hasClosedClassElement(body, "categories-wrap") {
 		return nil, invalidSource("empty absence container is incomplete")
 	}
-	return dedupeAbsences(out), nil
+	if duplicate := duplicateAbsenceSourceID(out); duplicate != "" {
+		return nil, invalidSource("absence source identifier is duplicated")
+	}
+	return out, nil
+}
+
+func duplicateGradeSourceID(items []model.Grade) string {
+	seen := map[string]bool{}
+	for _, item := range items {
+		if item.SourceID == "" {
+			continue
+		}
+		if seen[item.SourceID] {
+			return item.SourceID
+		}
+		seen[item.SourceID] = true
+	}
+	return ""
+}
+
+func duplicateAbsenceSourceID(items []model.Absence) string {
+	seen := map[string]bool{}
+	for _, item := range items {
+		if item.SourceID == "" {
+			continue
+		}
+		if seen[item.SourceID] {
+			return item.SourceID
+		}
+		seen[item.SourceID] = true
+	}
+	return ""
+}
+
+func sourceRecordID(item *goquery.Selection) string {
+	for _, name := range []string{"data-record-id", "data-id"} {
+		if value, ok := item.Attr(name); ok && clean(value) != "" {
+			return clean(value)
+		}
+	}
+	return ""
 }
 
 func validateSuppliedEnrolment(doc *goquery.Document, expected, section string) error {
@@ -497,18 +558,6 @@ func stableID(parts ...string) string {
 func dedupeSubjects(in []model.Subject) []model.Subject {
 	seen := map[string]bool{}
 	out := make([]model.Subject, 0, len(in))
-	for _, item := range in {
-		if !seen[item.ID] {
-			seen[item.ID] = true
-			out = append(out, item)
-		}
-	}
-	return out
-}
-
-func dedupeAbsences(in []model.Absence) []model.Absence {
-	seen := map[string]bool{}
-	out := make([]model.Absence, 0, len(in))
 	for _, item := range in {
 		if !seen[item.ID] {
 			seen[item.ID] = true

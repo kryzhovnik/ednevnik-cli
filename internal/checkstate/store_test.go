@@ -86,6 +86,67 @@ func TestGenerationCommitIsAtomicAndRetainsEvents(t *testing.T) {
 	}
 }
 
+func TestTransitionRevisionSurvivesValueReturningAndRedelivery(t *testing.T) {
+	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	baseline := result(profile, "check_a", model.OutcomeInitialBaseline, "1111111")
+	baseline.Baseline.NewEnrolments = []string{"1111111"}
+	if _, err := s.Commit(profile, baseline, observations("1111111")); err != nil {
+		t.Fatal(err)
+	}
+
+	transition := func(checkID, before, after string) model.CheckResult {
+		r := result(profile, checkID, model.OutcomeCompleteWithChanges, "1111111")
+		r.Changes = model.ChangeSummary{Count: 1, Items: []model.Change{{Kind: "grade_updated", RecordKey: "grade:stable", StudentID: "1111111", RecordID: "grade-1", Before: []model.RecordState{{Value: before}}, After: []model.RecordState{{Value: after}}, Summary: after}}}
+		return r
+	}
+	b := transition("check_b", "4", "5")
+	d, err := s.Commit(profile, b, observations("1111111"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, firstSequence := d.Events[0].ID, d.Events[0].Sequence
+	d, err = s.Commit(profile, b, observations("1111111"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Events) != 1 || d.Events[0].ID != firstID || d.Events[0].Sequence != firstSequence {
+		t.Fatalf("redelivery changed retained event: %#v", d.Events)
+	}
+	c := transition("check_c", "5", "4")
+	d, err = s.Commit(profile, c, observations("1111111"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Events) != 2 || d.Events[1].Revision != 2 || d.Events[1].ID == d.Events[0].ID || d.Events[1].Sequence <= d.Events[0].Sequence {
+		t.Fatalf("events = %#v", d.Events)
+	}
+}
+
+func TestRevisionRecoversSafePreRecordKeyAbsenceLineage(t *testing.T) {
+	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	baseline := result(profile, "check_a", model.OutcomeInitialBaseline, "1111111")
+	baseline.Baseline.NewEnrolments = []string{"1111111"}
+	if _, err := s.Commit(profile, baseline, observations("1111111")); err != nil {
+		t.Fatal(err)
+	}
+	legacy := result(profile, "check_b", model.OutcomeCompleteWithChanges, "1111111")
+	legacy.Changes = model.ChangeSummary{Count: 1, Items: []model.Change{{Kind: "absence_added", StudentID: "1111111", RecordID: "old-content-hash", Subject: "Math", Date: "date", Period: "2"}}}
+	if _, err := s.Commit(profile, legacy, observations("1111111")); err != nil {
+		t.Fatal(err)
+	}
+	current := result(profile, "check_c", model.OutcomeCompleteWithChanges, "1111111")
+	current.Changes = model.ChangeSummary{Count: 1, Items: []model.Change{{Kind: "absence_updated", RecordKey: "absence:new-key", StudentID: "1111111", RecordID: "fallback", Subject: "Math", Date: "date", Period: "2"}}}
+	d, err := s.Commit(profile, current, observations("1111111"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Events) != 2 || d.Events[1].Revision != 2 || d.Events[0].ID == d.Events[1].ID {
+		t.Fatalf("events=%#v", d.Events)
+	}
+}
+
 func TestPostRenameFailureReportsCommittedGeneration(t *testing.T) {
 	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
 	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}

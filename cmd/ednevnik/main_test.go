@@ -531,6 +531,85 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 }
 
+func TestProcessSuccessiveAbsenceCorrectionsRetainDistinctTransitions(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+
+	var status atomic.Value
+	status.Store("empty")
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/grades":
+			_, _ = w.Write([]byte(`<div class="flex-table"></div>`))
+		case "/absents":
+			if status.Load() == "empty" {
+				_, _ = w.Write([]byte(`<div class="categories-wrap"></div>`))
+				return
+			}
+			_, _ = fmt.Fprintf(w, `<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap %s"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Mathematics</div><div class="category-item-bottom-note">teacher note</div></div></div></div>`, status.Load())
+		case "/timeline-data":
+			_, _ = w.Write([]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer portal.Close()
+	stateDir := t.TempDir()
+	testRoot := t.TempDir()
+	run := func(force bool) checkResult {
+		t.Helper()
+		args := []string{"check", "--profile=family", "--student=1234567"}
+		if force {
+			args = append(args, "--force")
+		}
+		cmd := exec.Command(binary, args...)
+		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("check: %v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+		}
+		var result checkResult
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	if got := run(false); got.Outcome != model.OutcomeInitialBaseline {
+		t.Fatalf("initial=%#v", got)
+	}
+	status.Store("red")
+	if got := run(true); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_added" {
+		t.Fatalf("addition=%#v", got)
+	}
+	status.Store("green")
+	if got := run(true); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_updated" {
+		t.Fatalf("first correction=%#v", got)
+	}
+	status.Store("red")
+	if got := run(true); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_updated" {
+		t.Fatalf("second correction=%#v", got)
+	}
+
+	coord, err := coordination.New(stateDir, coordination.Namespace{Profile: "family", Origin: canonicalOrigin(portal.URL)}, coordination.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document checkstate.Document
+	if err := store.LoadSnapshot(filepath.Join(coord.StateDir(), "check-state.json"), &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.Events) != 3 || document.Events[0].Revision != 1 || document.Events[1].Revision != 2 || document.Events[2].Revision != 3 || document.Events[0].ID == document.Events[1].ID || document.Events[1].ID == document.Events[2].ID || document.Events[2].Sequence <= document.Events[1].Sequence {
+		t.Fatalf("events=%#v", document.Events)
+	}
+	if document.Events[1].Change.Before[0].Status != "unexcused" || document.Events[1].Change.After[0].Status != "excused" || document.Events[2].Change.After[0].Status != "unexcused" || document.Events[0].Change.RecordKey != document.Events[1].Change.RecordKey || document.Events[1].Change.RecordKey != document.Events[2].Change.RecordKey {
+		t.Fatalf("contexts=%#v", document.Events)
+	}
+}
+
 func TestConcurrentCLIProcessesShareAccountRequestPolicy(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "ednevnik")
 	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {

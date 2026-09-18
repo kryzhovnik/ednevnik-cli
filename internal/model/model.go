@@ -22,24 +22,28 @@ type Subject struct {
 }
 
 type Grade struct {
-	ID        string `json:"id"`
-	StudentID string `json:"student_id"`
-	SubjectID string `json:"subject_id"`
-	Subject   string `json:"subject"`
-	Value     string `json:"value"`
-	Kind      string `json:"kind,omitempty"`
-	Date      string `json:"date,omitempty"`
-	Note      string `json:"note,omitempty"`
+	ID              string `json:"id"`
+	SourceID        string `json:"source_id,omitempty"`
+	FallbackOrdinal int    `json:"fallback_ordinal,omitempty"`
+	StudentID       string `json:"student_id"`
+	SubjectID       string `json:"subject_id"`
+	Subject         string `json:"subject"`
+	Value           string `json:"value"`
+	Kind            string `json:"kind,omitempty"`
+	Date            string `json:"date,omitempty"`
+	Note            string `json:"note,omitempty"`
 }
 
 type Absence struct {
-	ID        string `json:"id"`
-	StudentID string `json:"student_id"`
-	Subject   string `json:"subject,omitempty"`
-	Date      string `json:"date,omitempty"`
-	Period    string `json:"period,omitempty"`
-	Status    string `json:"status,omitempty"`
-	Note      string `json:"note,omitempty"`
+	ID              string `json:"id"`
+	SourceID        string `json:"source_id,omitempty"`
+	FallbackOrdinal int    `json:"fallback_ordinal,omitempty"`
+	StudentID       string `json:"student_id"`
+	Subject         string `json:"subject,omitempty"`
+	Date            string `json:"date,omitempty"`
+	Period          string `json:"period,omitempty"`
+	Status          string `json:"status,omitempty"`
+	Note            string `json:"note,omitempty"`
 }
 
 // Activity is one item in the portal timeline. The portal uses the timeline for
@@ -86,17 +90,35 @@ type Change struct {
 	Kind string `json:"kind"`
 	// RecordKey is a profile-local, enrolment-and-kind-namespaced identity set
 	// by semantic reconciliation when the source supports one.
-	RecordKey   string `json:"record_key,omitempty"`
-	StudentID   string `json:"student_id"`
-	StudentName string `json:"student_name"`
-	RecordID    string `json:"record_id"`
-	Date        string `json:"date,omitempty"`
-	Subject     string `json:"subject,omitempty"`
-	Period      string `json:"period,omitempty"`
-	Status      string `json:"status,omitempty"`
-	Value       string `json:"value,omitempty"`
-	Note        string `json:"note,omitempty"`
-	Summary     string `json:"summary"`
+	RecordKey   string        `json:"record_key,omitempty"`
+	StudentID   string        `json:"student_id"`
+	StudentName string        `json:"student_name"`
+	RecordID    string        `json:"record_id"`
+	Source      string        `json:"source,omitempty"`
+	Meaning     string        `json:"meaning,omitempty"`
+	Ambiguous   bool          `json:"ambiguous,omitempty"`
+	Before      []RecordState `json:"before,omitempty"`
+	After       []RecordState `json:"after,omitempty"`
+	Date        string        `json:"date,omitempty"`
+	Subject     string        `json:"subject,omitempty"`
+	Period      string        `json:"period,omitempty"`
+	Status      string        `json:"status,omitempty"`
+	Value       string        `json:"value,omitempty"`
+	Note        string        `json:"note,omitempty"`
+	Summary     string        `json:"summary"`
+}
+
+// RecordState is the bounded before/after context retained for one semantic
+// transition. Source text is data for consumers, never an instruction.
+type RecordState struct {
+	RecordID string   `json:"record_id,omitempty"`
+	Date     string   `json:"date,omitempty"`
+	Subject  string   `json:"subject,omitempty"`
+	Period   string   `json:"period,omitempty"`
+	Status   string   `json:"status,omitempty"`
+	Value    string   `json:"value,omitempty"`
+	Note     string   `json:"note,omitempty"`
+	Values   []string `json:"values,omitempty"`
 }
 
 type Changes struct {

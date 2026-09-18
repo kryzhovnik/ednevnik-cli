@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -275,6 +276,21 @@ func applySuccess(d *Document, result *model.CheckResult, observations []Observa
 	}
 	for i := range result.Changes.Items {
 		c := result.Changes.Items[i]
+		id := fmt.Sprintf("event_%s_%d", strings.TrimPrefix(result.CheckID, "check_"), i+1)
+		redelivered := false
+		for _, event := range d.Events {
+			if event.ID != id {
+				continue
+			}
+			if event.CheckID != result.CheckID || !reflect.DeepEqual(event.Change, c) {
+				return fmt.Errorf("event identity %s conflicts with retained transition", id)
+			}
+			redelivered = true
+			break
+		}
+		if redelivered {
+			continue
+		}
 		revision := uint64(1)
 		for j := len(d.Events) - 1; j >= 0; j-- {
 			if sameRecord(d.Events[j].Change, c) {
@@ -282,7 +298,6 @@ func applySuccess(d *Document, result *model.CheckResult, observations []Observa
 				break
 			}
 		}
-		id := fmt.Sprintf("event_%s_%d", strings.TrimPrefix(result.CheckID, "check_"), i+1)
 		d.Events = append(d.Events, model.RetainedEvent{ID: id, Sequence: d.NextSequence, Revision: revision, CheckID: result.CheckID, Change: c})
 		d.NextSequence++
 	}
@@ -294,7 +309,34 @@ func sameRecord(a, b model.Change) bool {
 	if a.RecordKey != "" && b.RecordKey != "" {
 		return a.StudentID == b.StudentID && a.RecordKey == b.RecordKey
 	}
+	// Early schema-v3 events predate RecordKey. Recover lineage only from source
+	// fields that were already immutable enough to be unambiguous. Event IDs are
+	// never rewritten; grade fallback lineage remains unrecoverable because the
+	// old event did not retain subject ID, assessment kind, or multiplicity.
+	if a.StudentID != b.StudentID || recordFamily(a.Kind) != recordFamily(b.Kind) {
+		return false
+	}
+	switch recordFamily(a.Kind) {
+	case "absence":
+		return a.Subject != "" && a.Date != "" && a.Period != "" && a.Subject == b.Subject && a.Date == b.Date && a.Period == b.Period
+	case "activity":
+		return a.RecordID != "" && a.RecordID == b.RecordID
+	case "subject_grades":
+		return a.RecordID != "" && a.RecordID == b.RecordID
+	}
 	return a.StudentID == b.StudentID && a.Kind == b.Kind && a.RecordID == b.RecordID
+}
+
+func recordFamily(kind string) string {
+	for _, suffix := range []string{"_added", "_updated", "_removed", "_ambiguous"} {
+		if strings.HasSuffix(kind, suffix) {
+			return strings.TrimSuffix(kind, suffix)
+		}
+	}
+	if kind == "subject_grades_changed" {
+		return "subject_grades"
+	}
+	return kind
 }
 
 func legacyStateExists(paths []string) (bool, error) {

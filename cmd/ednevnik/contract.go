@@ -316,7 +316,7 @@ func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkRun,
 		} else if !known {
 			newEnrolments = append(newEnrolments, id)
 		} else {
-			diff := store.Diff(model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{prior.Snapshot}}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}})
+			diff := store.Reconcile(model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{prior.Snapshot}}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}}, store.ReconcileOptions{Namespace: req.ProfileID + "\x00" + r.app.origin})
 			changes = append(changes, filterTimelineAdditions(diff.Items, timeline.NewIDs)...)
 		}
 		observations = append(observations, checkstate.Observation{EnrolmentID: id, Snapshot: snapshot, TimelineBoundary: timeline.Boundary})
