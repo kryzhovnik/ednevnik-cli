@@ -367,15 +367,15 @@ func (r liveCheckRunner) readTimeline(ctx context.Context, enrolmentID string, p
 	pageNumber := 1
 	for {
 		if pageNumber > timelineCatchUpPageLimit {
-			return incompleteTimeline(items, "timeline_page_limit"), nil
+			return incompleteTimeline(items, "timeline_page_limit", len(seenPages)), nil
 		}
 		if pageNumber > 1 && r.nowTime().Sub(started) >= timelineCatchUpTimeLimit {
-			return incompleteTimeline(items, "timeline_time_limit"), nil
+			return incompleteTimeline(items, "timeline_time_limit", len(seenPages)), nil
 		}
 		body, err := r.app.get(catchCtx, fmt.Sprintf("/timeline-data?page=%d&student=%s", pageNumber, enrolmentID))
 		if err != nil {
 			if errors.Is(catchCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-				return incompleteTimeline(items, "timeline_time_limit"), nil
+				return incompleteTimeline(items, "timeline_time_limit", len(seenPages)), nil
 			}
 			return timelineRead{}, liveReadFailure(err)
 		}
@@ -389,44 +389,47 @@ func (r liveCheckRunner) readTimeline(ctx context.Context, enrolmentID string, p
 			firstPage = append([]model.Activity{}, page.Items...)
 			lastPage = page.LastPage
 		} else if page.LastPage != lastPage {
-			return incompleteTimeline(items, "timeline_source_changed"), nil
+			return incompleteTimeline(items, "timeline_source_changed", len(seenPages)+1), nil
 		}
 		for _, previousPage := range seenPages {
 			if reflect.DeepEqual(previousPage, page.Items) {
-				return incompleteTimeline(items, "timeline_repeated_page"), nil
+				return incompleteTimeline(items, "timeline_repeated_page", len(seenPages)+1), nil
 			}
 		}
 		seenPages = append(seenPages, append([]model.Activity{}, page.Items...))
 		for _, item := range page.Items {
 			if previous, exists := seen[item.ID]; exists {
 				if !reflect.DeepEqual(previous, item) {
-					return incompleteTimeline(items, "timeline_source_changed"), nil
+					return incompleteTimeline(items, "timeline_source_changed", len(seenPages)), nil
 				}
 				continue
 			}
 			seen[item.ID] = item
 			items = append(items, item)
 		}
-		if pageNumber == 1 && !known {
-			return timelineRead{Items: items, Boundary: pageIDs, NewIDs: newIDs, Section: sectionCoverage{Name: "timeline", State: "complete", Representation: "recent_baseline_page"}, Continuity: continuityCoverage{State: "complete", Reason: "recent_baseline_established"}, Complete: true}, nil
+		if pageNumber == 1 && !known && (len(page.Items) > 0 || page.NextPage == nil) {
+			return timelineRead{Items: items, Boundary: pageIDs, NewIDs: newIDs, Section: timelineSection("complete", "recent_baseline_page", len(seenPages), len(items)), Continuity: continuityCoverage{State: "complete", Reason: "recent_baseline_established"}, Complete: true}, nil
 		}
 		boundary := activityIDs(page.Items)
 		overlaps := hasTimelineOverlap(prior.TimelineBoundary, boundary)
 		if overlaps {
 			markNewActivityPrefix(newIDs, page.Items, prior.TimelineBoundary)
-			return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, "caught_up_pages", "timeline_overlap_established")
+			return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, len(seenPages), "caught_up_pages", "timeline_overlap_established")
 		}
 		for _, item := range page.Items {
 			newIDs[item.ID] = true
 		}
 		if len(prior.TimelineBoundary) == 0 && len(boundary) == 0 && page.NextPage == nil {
-			return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, "caught_up_to_source_boundary", "timeline_source_boundary_established")
+			return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, len(seenPages), "caught_up_to_source_boundary", "timeline_source_boundary_established")
 		}
 		if page.NextPage == nil {
-			if len(prior.TimelineBoundary) == 0 {
-				return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, "caught_up_to_source_boundary", "timeline_source_boundary_established")
+			if !known {
+				return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, len(seenPages), "recent_baseline_pages", "recent_baseline_established")
 			}
-			return incompleteTimeline(items, "timeline_gap"), nil
+			if len(prior.TimelineBoundary) == 0 {
+				return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, len(seenPages), "caught_up_to_source_boundary", "timeline_source_boundary_established")
+			}
+			return incompleteTimeline(items, "timeline_gap", len(seenPages)), nil
 		}
 		pageNumber = *page.NextPage
 	}
@@ -439,14 +442,14 @@ func (r liveCheckRunner) nowTime() time.Time {
 	return time.Now()
 }
 
-func (r liveCheckRunner) completeStableTimeline(parentCtx, catchCtx context.Context, enrolmentID string, items, firstPage []model.Activity, boundary []string, newIDs map[string]bool, lastPage int, started time.Time, representation, reason string) (timelineRead, error) {
+func (r liveCheckRunner) completeStableTimeline(parentCtx, catchCtx context.Context, enrolmentID string, items, firstPage []model.Activity, boundary []string, newIDs map[string]bool, lastPage int, started time.Time, inspectedPages int, representation, reason string) (timelineRead, error) {
 	if r.nowTime().Sub(started) >= timelineCatchUpTimeLimit {
-		return incompleteTimeline(items, "timeline_time_limit"), nil
+		return incompleteTimeline(items, "timeline_time_limit", inspectedPages), nil
 	}
 	body, err := r.app.get(catchCtx, "/timeline-data?page=1&student="+enrolmentID)
 	if err != nil {
 		if errors.Is(catchCtx.Err(), context.DeadlineExceeded) && parentCtx.Err() == nil {
-			return incompleteTimeline(items, "timeline_time_limit"), nil
+			return incompleteTimeline(items, "timeline_time_limit", inspectedPages), nil
 		}
 		return timelineRead{}, liveReadFailure(err)
 	}
@@ -455,12 +458,12 @@ func (r liveCheckRunner) completeStableTimeline(parentCtx, catchCtx context.Cont
 		return timelineRead{}, &checkFailure{Reason: model.ReasonInvalidSource, Err: errors.New("timeline head revalidation did not match the recognized source structure"), Action: "Keep the last successful baseline and inspect portal compatibility before retrying."}
 	}
 	if head.LastPage != lastPage || !reflect.DeepEqual(head.Items, firstPage) {
-		return incompleteTimeline(items, "timeline_source_changed"), nil
+		return incompleteTimeline(items, "timeline_source_changed", inspectedPages), nil
 	}
 	if r.nowTime().Sub(started) >= timelineCatchUpTimeLimit {
-		return incompleteTimeline(items, "timeline_time_limit"), nil
+		return incompleteTimeline(items, "timeline_time_limit", inspectedPages), nil
 	}
-	return timelineRead{Items: items, Boundary: boundary, NewIDs: newIDs, Section: sectionCoverage{Name: "timeline", State: "complete", Representation: representation}, Continuity: continuityCoverage{State: "complete", Reason: reason}, Complete: true}, nil
+	return timelineRead{Items: items, Boundary: boundary, NewIDs: newIDs, Section: timelineSection("complete", representation, inspectedPages, len(items)), Continuity: continuityCoverage{State: "complete", Reason: reason}, Complete: true}, nil
 }
 
 func markNewActivityPrefix(newIDs map[string]bool, items []model.Activity, priorBoundary []string) {
@@ -476,8 +479,12 @@ func markNewActivityPrefix(newIDs map[string]bool, items []model.Activity, prior
 	}
 }
 
-func incompleteTimeline(items []model.Activity, reason string) timelineRead {
-	return timelineRead{Items: items, Section: sectionCoverage{Name: "timeline", State: "incomplete", Representation: "bounded_catch_up"}, Continuity: continuityCoverage{State: "incomplete", Reason: reason}}
+func incompleteTimeline(items []model.Activity, reason string, inspectedPages int) timelineRead {
+	return timelineRead{Items: items, Section: timelineSection("incomplete", "bounded_catch_up", inspectedPages, len(items)), Continuity: continuityCoverage{State: "incomplete", Reason: reason}}
+}
+
+func timelineSection(state, representation string, inspectedPages, records int) sectionCoverage {
+	return sectionCoverage{Name: "timeline", State: state, Representation: representation, FirstPage: 1, LastPage: inspectedPages, PageCount: inspectedPages, RecordsInspected: records, CorrectionCoverage: "inspected_timeline_pages_only"}
 }
 
 func activityIDs(items []model.Activity) []string {

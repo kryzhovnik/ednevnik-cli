@@ -48,9 +48,14 @@ type EnrolmentCoverage struct {
 	Continuity  ContinuityCoverage `json:"continuity"`
 }
 type SectionCoverage struct {
-	Name           string `json:"name"`
-	State          string `json:"state"`
-	Representation string `json:"representation"`
+	Name               string `json:"name"`
+	State              string `json:"state"`
+	Representation     string `json:"representation"`
+	FirstPage          int    `json:"first_page,omitempty"`
+	LastPage           int    `json:"last_page,omitempty"`
+	PageCount          int    `json:"page_count,omitempty"`
+	RecordsInspected   int    `json:"records_inspected,omitempty"`
+	CorrectionCoverage string `json:"correction_coverage,omitempty"`
 }
 type ContinuityCoverage struct {
 	State  string `json:"state"`

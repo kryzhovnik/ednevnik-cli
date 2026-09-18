@@ -6,8 +6,10 @@ selects the account/origin-bound check state. `sync` without `--profile` keeps
 the schema-v2 snapshot/output contract for compatibility and does not claim
 catch-up coverage.
 
-For a new enrolment, the check reads and validates only the newest timeline
-page. It commits those records as a recent baseline and emits no historical
+For a new enrolment, the check normally reads and validates only the newest
+timeline page. If that page is empty but advertises an older page, the check
+continues within the same bounds to avoid committing a false empty boundary.
+It commits all inspected records as a recent baseline and emits no historical
 events. This policy bounds initial traffic and avoids presenting existing
 school history as new activity. It does not establish all-history coverage.
 
@@ -45,6 +47,12 @@ Coverage reports the distinction directly:
 - `caught_up_to_source_boundary` records the special empty-boundary proof;
 - `bounded_catch_up` with an incomplete reason records inspected but
   uncommitted work.
+
+The timeline section also reports `first_page`, `last_page`, `page_count`, and
+`records_inspected`. `correction_coverage` is
+`inspected_timeline_pages_only`, separate from continuity: continuity proves
+that new activity reaches the committed boundary, while correction coverage
+states only where edits were compared.
 
 Corrections are detected only for records in the inspected validated pages.
 An item leaving the recent feed is window eviction, not deletion evidence.

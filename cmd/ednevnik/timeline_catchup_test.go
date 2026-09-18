@@ -132,6 +132,8 @@ func TestTimelineCatchUpCommitsAllPagesThroughOverlap(t *testing.T) {
 	}
 	if got := result.Coverage[0]; got.Continuity.Reason != "timeline_overlap_established" || got.Sections[2].Representation != "caught_up_pages" {
 		t.Fatalf("coverage=%#v", got)
+	} else if got.Sections[2].FirstPage != 1 || got.Sections[2].LastPage != 2 || got.Sections[2].PageCount != 2 || got.Sections[2].RecordsInspected != 4 || got.Sections[2].CorrectionCoverage != "inspected_timeline_pages_only" {
+		t.Fatalf("timeline inspection evidence=%#v", got.Sections[2])
 	}
 	doc, err := a.checkStateStore("family").Load(checkProfile{ID: "family", Origin: a.origin})
 	if err != nil {
@@ -179,6 +181,27 @@ func TestTimelineCatchUpTraversesEmptyNonfinalPageForEmptyBoundary(t *testing.T)
 	result, err := runCheckResult(t, a)
 	if err != nil || result.Outcome != model.OutcomeCompleteWithChanges || result.Changes.Count != 1 || len(client.requests) < 4 {
 		t.Fatalf("result=%#v requests=%v err=%v", result, client.requests, err)
+	}
+}
+
+func TestInitialEmptyNonfinalTimelineDoesNotFloodNextCheck(t *testing.T) {
+	dir := t.TempDir()
+	client := &timelineScriptClient{pages: map[int]string{
+		1: timelinePage(1, 2),
+		2: timelinePage(2, 2, timelineItem(100, "historical")),
+	}}
+	a := &app{dir: dir, origin: "https://portal.example", client: client}
+	initial, err := runCheckResult(t, a)
+	if err != nil || initial.Outcome != model.OutcomeInitialBaseline || initial.Changes.Count != 0 || initial.Coverage[0].Sections[2].Representation != "recent_baseline_pages" {
+		t.Fatalf("initial=%#v err=%v", initial, err)
+	}
+	unchanged, err := runCheckResult(t, a)
+	if err != nil || unchanged.Outcome != model.OutcomeCompleteWithoutChanges || unchanged.Changes.Count != 0 {
+		t.Fatalf("unchanged=%#v err=%v", unchanged, err)
+	}
+	doc, err := a.checkStateStore("family").Load(checkProfile{ID: "family", Origin: a.origin})
+	if err != nil || len(doc.Events) != 0 || len(doc.Baselines["1234567"].Snapshot.Activities) != 1 {
+		t.Fatalf("state=%#v err=%v", doc, err)
 	}
 }
 

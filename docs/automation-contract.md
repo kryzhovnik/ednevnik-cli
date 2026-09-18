@@ -160,3 +160,5 @@ reliable check and uses the same bounded timeline catch-up and coherent commit.
 `sync` without `--profile` retains schema-v2 output and storage compatibility;
 it reads only the newest timeline page and must not be used as evidence of
 complete catch-up. See [Timeline catch-up and coverage](timeline-catchup.md).
+Timeline section coverage carries the inspected page range/count and record
+count. Its correction-coverage field is separate from continuity evidence.
