@@ -481,6 +481,70 @@ func TestRealCLIFailedAuthCheckThenProviderRecovery(t *testing.T) {
 	}
 }
 
+func TestFreshBindingSaveFailureCannotReuseObsoleteSession(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, `<form action="/login"><input name="_token" value="csrf"><input name="password"></form>`)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		http.SetCookie(w, &http.Cookie{Name: "account", Value: r.Form.Get("username"), Path: "/"})
+		http.Redirect(w, r, "/", http.StatusFound)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := r.Cookie("account"); err != nil {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		_, _ = io.WriteString(w, `<div class="students-list"></div>`)
+	})
+	portal := httptest.NewServer(mux)
+	defer portal.Close()
+	root := t.TempDir()
+	config := coordination.DefaultConfig()
+	config.RequestPace = 0
+	coord, err := coordination.New(root, coordination.Namespace{Profile: "family", Origin: canonicalOrigin(portal.URL)}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := coord.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	sessionPath := filepath.Join(coord.StateDir(), "session.json")
+	c, err := client.New(portal.URL, sessionPath, "family", lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Login(context.Background(), "account-a", "password"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sessionPath+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{client: c, accountDir: coord.StateDir(), profile: "family", origin: canonicalOrigin(portal.URL)}
+	if err := a.loginAndBind(context.Background(), credentials.Credential{Username: "account-b", Password: []byte("password")}); err == nil {
+		t.Fatal("injected session save failure succeeded")
+	}
+	if _, err := os.Stat(sessionPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete session remains usable: %v", err)
+	}
+	if err := os.Remove(sessionPath + ".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := client.New(portal.URL, sessionPath, "family", lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.Get(context.Background(), "/"); !errors.Is(err, client.ErrNotAuthenticated) {
+		t.Fatalf("obsolete account session reused: %v", err)
+	}
+}
+
 func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "ednevnik")
 	build := exec.Command("go", "build", "-o", binary, ".")
@@ -963,6 +1027,7 @@ func (f *retryClient) Login(context.Context, string, string) error {
 	return nil
 }
 func (f *retryClient) BudgetStatus() (string, int, int, error) { return "2026-09-12", 0, 100, nil }
+func (f *retryClient) ResetSession() error                     { return nil }
 func (f *retryClient) Get(context.Context, string) ([]byte, error) {
 	f.gets++
 	if f.gets == 1 {

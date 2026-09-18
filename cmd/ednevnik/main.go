@@ -427,6 +427,19 @@ func (a *app) commitCredentialAccount(username string) error {
 }
 
 func (a *app) loginAndBind(ctx context.Context, credential credentials.Credential) error {
+	bound, err := a.validateCredentialAccount(credential.Username)
+	if err != nil {
+		return err
+	}
+	if !bound {
+		resetter, ok := a.client.(interface{ ResetSession() error })
+		if !ok {
+			return errors.New("fresh account verification requires session reset support")
+		}
+		if err := resetter.ResetSession(); err != nil {
+			return fmt.Errorf("invalidate obsolete session: %w", err)
+		}
+	}
 	commit := func() error { return a.commitCredentialAccount(credential.Username) }
 	if c, ok := a.client.(interface {
 		LoginWithCommit(context.Context, string, string, func() error) error
