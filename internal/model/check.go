@@ -65,6 +65,16 @@ type ChangeSummary struct {
 	Count int      `json:"count"`
 	Items []Change `json:"items"`
 }
+
+// RetainedEvent is the durable ordering envelope for a committed transition.
+// Change semantics are intentionally supplied by the reconciliation module.
+type RetainedEvent struct {
+	ID       string `json:"id"`
+	Sequence uint64 `json:"sequence"`
+	Revision uint64 `json:"revision"`
+	CheckID  string `json:"check_id"`
+	Change   Change `json:"change"`
+}
 type Guidance struct {
 	Retryable  bool       `json:"retryable"`
 	RetryAfter *time.Time `json:"retry_after,omitempty"`

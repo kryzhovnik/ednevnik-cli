@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/kryzhovnik/ednevnik/internal/checkstate"
 	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/coordination"
 	"github.com/kryzhovnik/ednevnik/internal/model"
@@ -36,10 +36,16 @@ type checkRequest struct {
 	ProfileID  string
 	Enrolments []string
 	StartedAt  time.Time
+	Prior      map[string]checkstate.Baseline
 }
 
 type checkRunner interface {
-	Check(context.Context, checkRequest) (checkResult, error)
+	Check(context.Context, checkRequest) (checkRun, error)
+}
+
+type checkRun struct {
+	Result       checkResult
+	Observations []checkstate.Observation
 }
 
 type commandError struct {
@@ -64,11 +70,6 @@ func (e *checkFailure) Unwrap() error { return e.Err }
 func (e *commandError) Error() string { return e.body.Message }
 
 type exitStatus struct{ code int }
-
-type invalidCheckStatusError struct{ err error }
-
-func (e *invalidCheckStatusError) Error() string { return e.err.Error() }
-func (e *invalidCheckStatusError) Unwrap() error { return e.err }
 
 func (e *exitStatus) Error() string { return fmt.Sprintf("exit status %d", e.code) }
 
@@ -107,15 +108,14 @@ func (a *app) check(ctx context.Context, args []string) error {
 		return newContractError("", model.ReasonInvalidArgument, err, false, "Correct EDNEVNIK_MIN_CHECK_INTERVAL.", 2)
 	}
 	if !*force {
-		var prior checkStatus
-		statusErr := store.LoadSnapshot(a.checkStatusPath(*profile), &prior)
-		if statusErr == nil && prior.LatestAttempt != nil && !prior.LatestAttempt.CompletedAt.IsZero() {
-			elapsed := time.Since(prior.LatestAttempt.CompletedAt)
+		priorState, statusErr := a.checkStateStore(*profile).Load(checkProfile{ID: *profile, Origin: a.origin})
+		if statusErr == nil && priorState.LatestAttempt != nil && !priorState.LatestAttempt.CompletedAt.IsZero() {
+			elapsed := time.Since(priorState.LatestAttempt.CompletedAt)
 			if elapsed < minimum {
 				return newContractError("", model.ReasonRefusalQuota, fmt.Errorf("minimum check interval is %s; retry in %s", minimum, (minimum-elapsed).Round(time.Second)), true, "Wait for the local interval or use --force; force still respects request budgets and server cooldowns.", 1)
 			}
-		} else if statusErr != nil && !os.IsNotExist(statusErr) {
-			return newContractError("", model.ReasonInvalidState, statusErr, false, "Preserve and repair the existing status file.", 1)
+		} else if statusErr != nil && !errors.Is(statusErr, checkstate.ErrAbsent) {
+			return newContractError("", model.ReasonInvalidState, statusErr, false, "Preserve the state. Archive legacy schema-v2 files before establishing a schema-v3 baseline, or repair the named schema-v3 state file.", 1)
 		}
 	}
 	now := time.Now().UTC()
@@ -124,14 +124,24 @@ func (a *app) check(ctx context.Context, args []string) error {
 		return newContractError("", "io", err, true, "Retry the command.", 1)
 	}
 	req := checkRequest{CheckID: checkID, ProfileID: *profile, Enrolments: selected, StartedAt: now}
+	stateStore := a.checkStateStore(*profile)
+	prior, loadErr := stateStore.Load(checkProfile{ID: *profile, Origin: a.origin})
+	if loadErr == nil {
+		req.Prior = prior.Baselines
+	} else if !errors.Is(loadErr, checkstate.ErrAbsent) {
+		return newContractError(req.CheckID, model.ReasonInvalidState, loadErr, false, "Preserve the state. For legacy schema-v2 data, archive it and establish a schema-v3 baseline; otherwise repair the named state file.", 1)
+	} else {
+		req.Prior = map[string]checkstate.Baseline{}
+	}
 	runner := a.checker
 	if runner == nil {
 		runner = liveCheckRunner{app: a}
 	}
-	result, err := runner.Check(ctx, req)
+	run, err := runner.Check(ctx, req)
 	if err != nil {
 		return a.failCheck(req, classifyCheckError(req.CheckID, err))
 	}
+	result := run.Result
 	result.SchemaVersion = checkSchemaVersion
 	result.CheckID = req.CheckID
 	result.Profile = checkProfile{ID: req.ProfileID, Origin: a.origin}
@@ -146,18 +156,27 @@ func (a *app) check(ctx context.Context, args []string) error {
 	if result.Changes.Items == nil {
 		result.Changes.Items = []model.Change{}
 	}
+	if result.Changes.Count != len(result.Changes.Items) {
+		return a.failCheck(req, newContractError(req.CheckID, model.ReasonInvalidState, errors.New("change count does not match items"), false, "Repair the check implementation; no successful baseline was committed.", 1))
+	}
 	if err := validateCheckResult(result); err != nil {
 		return a.failCheck(req, newContractError(req.CheckID, "invalid_state", err, false, "Do not consume this result; repair the check implementation or local state.", 1))
 	}
-	if err := a.recordCheckStatus(result); err != nil {
-		var invalid *invalidCheckStatusError
-		if errors.As(err, &invalid) {
+	committed, err := stateStore.Commit(result.Profile, result, run.Observations)
+	if err != nil {
+		var stateInvalid *checkstate.InvalidError
+		if errors.As(err, &stateInvalid) {
 			return newContractError(req.CheckID, model.ReasonInvalidState, errors.New("existing check status is invalid or belongs to another account/profile origin"), false, "Preserve the file and migrate or recover it explicitly.", 1)
+		}
+		var commitErr *checkstate.CommitError
+		if errors.As(err, &commitErr) && commitErr.Committed {
+			return newContractError(req.CheckID, model.ReasonIO, errors.New("check committed but durable-directory confirmation or output did not complete"), true, "Inspect local status for this check ID before retrying; committed retained events remain available.", 1)
 		}
 		return newContractError(req.CheckID, "io", err, true, "Check local state permissions and free space, then retry.", 1)
 	}
+	result = *committed.LatestAttempt
 	if err := output(result); err != nil {
-		return err
+		return newContractError(req.CheckID, model.ReasonIO, errors.New("check committed but result output was interrupted"), true, "Inspect local status for this check ID before retrying; committed retained events remain available.", 1)
 	}
 	if result.Outcome == "incomplete" {
 		return &exitStatus{code: 3}
@@ -171,8 +190,8 @@ func (a *app) failCheck(req checkRequest, ce *commandError) error {
 	ce.body.Profile = &failed.Profile
 	ce.body.Requested = failed.Requested
 	ce.body.Coverage = failed.Coverage
-	if err := a.recordCheckStatus(failed); err != nil {
-		var invalid *invalidCheckStatusError
+	if _, err := a.checkStateStore(req.ProfileID).Commit(failed.Profile, failed, nil); err != nil {
+		var invalid *checkstate.InvalidError
 		if errors.As(err, &invalid) {
 			return newContractError(req.CheckID, model.ReasonInvalidState, errors.New("existing check status is invalid or belongs to another account/profile origin"), false, "Preserve the file and migrate or recover it explicitly.", 1)
 		}
@@ -247,43 +266,89 @@ func validateRequestedCoverage(result checkResult, requireComplete bool) error {
 
 type liveCheckRunner struct{ app *app }
 
-func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkResult, error) {
+func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkRun, error) {
 	coverage := make([]enrolmentCoverage, 0, len(req.Enrolments))
+	observations := make([]checkstate.Observation, 0, len(req.Enrolments))
+	changes := []model.Change{}
+	newEnrolments := []string{}
+	complete := true
 	for _, id := range req.Enrolments {
 		current := enrolmentCoverage{EnrolmentID: id, Sections: []sectionCoverage{}, Continuity: continuityCoverage{State: "not_checked"}}
 		body, err := r.app.get(ctx, "/grades?student="+id)
 		if err != nil {
-			return checkResult{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
+			return checkRun{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
 		}
-		if _, err := parse.Subjects(body, id); err != nil {
-			return checkResult{}, invalidSourceFailure("grade overview did not match the recognized source structure", coverage, current)
+		subjects, err := parse.Subjects(body, id)
+		if err != nil {
+			return checkRun{}, invalidSourceFailure("grade overview did not match the recognized source structure", coverage, current)
 		}
 		current.Sections = append(current.Sections, sectionCoverage{Name: "grades", State: "complete", Representation: "overview"})
 		body, err = r.app.get(ctx, "/absents?student="+id)
 		if err != nil {
-			return checkResult{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
+			return checkRun{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
 		}
-		if _, err := parse.Absences(body, id); err != nil {
-			return checkResult{}, invalidSourceFailure("absence response did not match the recognized source structure", coverage, current)
+		absences, err := parse.Absences(body, id)
+		if err != nil {
+			return checkRun{}, invalidSourceFailure("absence response did not match the recognized source structure", coverage, current)
 		}
 		current.Sections = append(current.Sections, sectionCoverage{Name: "absences", State: "complete", Representation: "current_records"})
 		body, err = r.app.get(ctx, "/timeline-data?page=1&student="+id)
 		if err != nil {
-			return checkResult{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
+			return checkRun{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
 		}
-		if _, err := parse.Timeline(body, id, 1); err != nil {
-			return checkResult{}, invalidSourceFailure("timeline response did not match the recognized source structure", coverage, current)
+		page, err := parse.Timeline(body, id, 1)
+		if err != nil {
+			return checkRun{}, invalidSourceFailure("timeline response did not match the recognized source structure", coverage, current)
 		}
 		current.Sections = append(current.Sections, sectionCoverage{Name: "timeline", State: "complete", Representation: "newest_page"})
-		current.Continuity = continuityCoverage{State: "incomplete", Reason: "timeline_catch_up_not_implemented"}
+		snapshot := model.StudentData{Student: model.Student{ID: id}, Subjects: subjects, Grades: []model.Grade{}, Absences: absences, Activities: page.Items}
+		boundary := activityIDs(page.Items)
+		prior, known := req.Prior[id]
+		if !known {
+			newEnrolments = append(newEnrolments, id)
+			current.Continuity = continuityCoverage{State: "complete", Reason: "recent_baseline_established"}
+		} else if hasTimelineOverlap(prior.TimelineBoundary, boundary) || (len(prior.TimelineBoundary) == 0 && len(boundary) == 0) {
+			current.Continuity = continuityCoverage{State: "complete"}
+			diff := store.Diff(model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{prior.Snapshot}}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}})
+			changes = append(changes, diff.Items...)
+		} else {
+			current.Continuity = continuityCoverage{State: "incomplete", Reason: "timeline_catch_up_not_implemented"}
+			complete = false
+		}
+		observations = append(observations, checkstate.Observation{EnrolmentID: id, Snapshot: snapshot, TimelineBoundary: boundary})
 		coverage = append(coverage, current)
 	}
-	return checkResult{
-		Outcome: "incomplete", Coverage: coverage,
-		Baseline: baselineReference{NewEnrolments: []string{}},
-		Changes:  changeSummary{Items: []model.Change{}},
-		Guidance: guidance{Retryable: false, Action: "No baseline was committed. Use legacy sync only for schema-v2 consumers; wait for continuity support before treating this check as complete."},
-	}, nil
+	if !complete {
+		return checkRun{Result: checkResult{Outcome: model.OutcomeIncomplete, Coverage: coverage, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: guidance{Retryable: false, Action: "The last complete baseline remains committed. Timeline catch-up support is required before this observation can advance it."}}}, nil
+	}
+	outcome := model.OutcomeCompleteWithoutChanges
+	if len(req.Prior) == 0 {
+		outcome = model.OutcomeInitialBaseline
+	} else if len(changes) > 0 {
+		outcome = model.OutcomeCompleteWithChanges
+	}
+	return checkRun{Result: checkResult{Outcome: outcome, Coverage: coverage, Baseline: baselineReference{ID: "baseline_" + strings.TrimPrefix(req.CheckID, "check_"), NewEnrolments: newEnrolments}, Changes: changeSummary{Count: len(changes), Items: changes}, Guidance: guidance{Action: "Committed retained events remain local until consumer replay is available."}}, Observations: observations}, nil
+}
+
+func activityIDs(items []model.Activity) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+func hasTimelineOverlap(a, b []string) bool {
+	seen := map[string]bool{}
+	for _, id := range a {
+		seen[id] = true
+	}
+	for _, id := range b {
+		if seen[id] {
+			return true
+		}
+	}
+	return false
 }
 
 func liveReadFailure(err error) error {
@@ -337,81 +402,6 @@ func failedResult(req checkRequest, e contractError) checkResult {
 		coverage = []enrolmentCoverage{}
 	}
 	return checkResult{SchemaVersion: checkSchemaVersion, CheckID: req.CheckID, Outcome: "failed", Profile: checkProfile{ID: req.ProfileID}, Requested: req.Enrolments, Coverage: coverage, StartedAt: req.StartedAt, CompletedAt: e.OccurredAt, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: e.Guidance, Failure: &model.FailureSummary{Reason: e.Reason}}
-}
-
-func (a *app) recordCheckStatus(result checkResult) error {
-	if result.Profile.ID == "" || result.Profile.Origin == "" {
-		return errors.New("check result has no account/profile origin namespace")
-	}
-	path := a.checkStatusPath(result.Profile.ID)
-	var status checkStatus
-	exists := true
-	if err := store.LoadSnapshot(path, &status); err != nil {
-		if os.IsNotExist(err) {
-			exists = false
-		} else {
-			var syntaxErr *json.SyntaxError
-			var typeErr *json.UnmarshalTypeError
-			if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
-				return &invalidCheckStatusError{err: err}
-			}
-			return err
-		}
-	}
-	if exists {
-		if err := validateCheckStatus(status, result.Profile.ID, result.Profile.Origin); err != nil {
-			return &invalidCheckStatusError{err: err}
-		}
-	}
-	status.SchemaVersion = checkSchemaVersion
-	status.History = "latest_attempt_only"
-	status.LatestAttempt = &result
-	if result.Outcome == "initial_baseline" || result.Outcome == "complete_with_changes" || result.Outcome == "complete_without_changes" {
-		status.LastSuccess = &result
-	}
-	return store.SaveSnapshot(path, status)
-}
-
-func validateCheckStatus(status checkStatus, profileID, origin string) error {
-	if status.SchemaVersion != checkSchemaVersion || status.History != "latest_attempt_only" || status.LatestAttempt == nil {
-		return errors.New("unsupported check status envelope")
-	}
-	validateBinding := func(result *checkResult) error {
-		if result.Profile.ID != profileID || result.Profile.Origin != origin || result.CheckID == "" {
-			return errors.New("check status account/profile origin mismatch")
-		}
-		return nil
-	}
-	if err := validateBinding(status.LatestAttempt); err != nil {
-		return err
-	}
-	switch status.LatestAttempt.Outcome {
-	case model.OutcomeInitialBaseline, model.OutcomeCompleteWithChanges, model.OutcomeCompleteWithoutChanges, model.OutcomeIncomplete, model.OutcomeFailed:
-	default:
-		return errors.New("unsupported latest-attempt outcome")
-	}
-	if status.LatestAttempt.Outcome != model.OutcomeFailed {
-		if err := validateCheckResult(*status.LatestAttempt); err != nil {
-			return err
-		}
-	}
-	if status.LatestAttempt.Outcome == model.OutcomeFailed && (status.LatestAttempt.Failure == nil || status.LatestAttempt.Failure.Reason == "") {
-		return errors.New("failed latest attempt has no reason")
-	}
-	if status.LastSuccess != nil {
-		if err := validateBinding(status.LastSuccess); err != nil {
-			return err
-		}
-		switch status.LastSuccess.Outcome {
-		case model.OutcomeInitialBaseline, model.OutcomeCompleteWithChanges, model.OutcomeCompleteWithoutChanges:
-		default:
-			return errors.New("last success has a non-success outcome")
-		}
-		if err := validateCheckResult(*status.LastSuccess); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func newCheckID() (string, error) {

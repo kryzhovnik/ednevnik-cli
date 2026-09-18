@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kryzhovnik/ednevnik/internal/checkstate"
 	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/coordination"
 	"github.com/kryzhovnik/ednevnik/internal/model"
@@ -57,8 +58,12 @@ type scriptedCheckRunner struct {
 	err    error
 }
 
-func (r scriptedCheckRunner) Check(context.Context, checkRequest) (checkResult, error) {
-	return r.result, r.err
+func (r scriptedCheckRunner) Check(_ context.Context, req checkRequest) (checkRun, error) {
+	observations := make([]checkstate.Observation, 0, len(req.Enrolments))
+	for _, id := range req.Enrolments {
+		observations = append(observations, checkstate.Observation{EnrolmentID: id, Snapshot: model.StudentData{Student: model.Student{ID: id}}, TimelineBoundary: []string{}})
+	}
+	return checkRun{Result: r.result, Observations: observations}, r.err
 }
 
 func captureStdout(t *testing.T, fn func() error) ([]byte, error) {
@@ -99,6 +104,9 @@ func TestCheckContractScriptedOutcomes(t *testing.T) {
 				Changes:  changeSummary{Count: tt.count, Items: []model.Change{}},
 				Guidance: guidance{Action: "Read retained events with the consumer batch command when available."},
 			}
+			if tt.count > 0 {
+				result.Changes.Items = []model.Change{{Kind: "test_transition", StudentID: "1234567", RecordID: "record-1", Summary: "changed"}}
+			}
 			a := &app{dir: dir, origin: "https://portal.example", checker: scriptedCheckRunner{result: result}}
 			data, err := captureStdout(t, func() error {
 				return a.check(context.Background(), []string{"--profile", "family", "--student", "1234567", "--student", "1234567"})
@@ -113,12 +121,12 @@ func TestCheckContractScriptedOutcomes(t *testing.T) {
 			if got.SchemaVersion != 3 || got.Outcome != tt.outcome || len(got.Requested) != 1 || got.Profile.ID != "family" || got.Profile.Origin != "https://portal.example" {
 				t.Fatalf("result=%#v", got)
 			}
-			var status checkStatus
-			if err := store.LoadSnapshot(filepath.Join(dir, "profiles", "family", "check-status.json"), &status); err != nil {
+			var document checkstate.Document
+			if err := store.LoadSnapshot(filepath.Join(dir, "profiles", "family", "check-state.json"), &document); err != nil {
 				t.Fatal(err)
 			}
-			if status.LastSuccess == nil || status.LatestAttempt == nil || status.History != "latest_attempt_only" {
-				t.Fatalf("status=%#v", status)
+			if document.LastSuccess == nil || document.LatestAttempt == nil {
+				t.Fatalf("state=%#v", document)
 			}
 		})
 	}
@@ -137,12 +145,74 @@ func TestCheckContractInjectedErrorRecordsFailedAttempt(t *testing.T) {
 	if got.body.Profile == nil || got.body.Profile.ID != "family" || len(got.body.Requested) != 1 {
 		t.Fatalf("error contract=%#v", got.body)
 	}
-	var status checkStatus
-	if err := store.LoadSnapshot(filepath.Join(dir, "profiles", "family", "check-status.json"), &status); err != nil {
+	var document checkstate.Document
+	if err := store.LoadSnapshot(filepath.Join(dir, "profiles", "family", "check-state.json"), &document); err != nil {
 		t.Fatal(err)
 	}
-	if status.LatestAttempt == nil || status.LatestAttempt.Outcome != "failed" || status.LatestAttempt.Failure == nil || status.LatestAttempt.Failure.Reason != "refusal_quota" || status.LastSuccess != nil {
-		t.Fatalf("status=%#v", status)
+	if document.LatestAttempt == nil || document.LatestAttempt.Outcome != "failed" || document.LatestAttempt.Failure == nil || document.LatestAttempt.Failure.Reason != "refusal_quota" || document.LastSuccess != nil {
+		t.Fatalf("state=%#v", document)
+	}
+}
+
+func TestCommittedCheckSurvivesOutputInterruption(t *testing.T) {
+	dir := t.TempDir()
+	result := checkResult{Outcome: model.OutcomeInitialBaseline, Coverage: []enrolmentCoverage{{EnrolmentID: "1234567", Sections: []sectionCoverage{{Name: "grades", State: "complete"}, {Name: "absences", State: "complete"}, {Name: "timeline", State: "complete"}}, Continuity: continuityCoverage{State: "complete"}}}, Baseline: baselineReference{ID: "baseline-test", NewEnrolments: []string{"1234567"}}, Changes: changeSummary{Items: []model.Change{}}}
+	a := &app{dir: dir, origin: "https://portal.example", checker: scriptedCheckRunner{result: result}}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	err = a.check(context.Background(), []string{"--profile=family", "--student=1234567"})
+	os.Stdout = old
+	_ = w.Close()
+	var ce *commandError
+	if !errors.As(err, &ce) || ce.body.CheckID == "" || !strings.Contains(ce.body.Guidance.Action, "status") {
+		t.Fatalf("error=%#v", err)
+	}
+	document, loadErr := a.checkStateStore("family").Load(checkProfile{ID: "family", Origin: a.origin})
+	if loadErr != nil || document.LastSuccess == nil || document.LastSuccess.CheckID != ce.body.CheckID {
+		t.Fatalf("state=%#v err=%v", document, loadErr)
+	}
+}
+
+func TestLiveRetryAfterInterruptedOutputDoesNotDuplicateTransition(t *testing.T) {
+	dir := t.TempDir()
+	client := &fakeClient{}
+	a := &app{dir: dir, origin: "https://portal.example", client: client}
+	if _, err := captureStdout(t, func() error { return a.check(context.Background(), []string{"--profile=family", "--student=1234567"}) }); err != nil {
+		t.Fatal(err)
+	}
+	client.second = true
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	old := os.Stdout
+	os.Stdout = w
+	err = a.check(context.Background(), []string{"--force", "--profile=family", "--student=1234567"})
+	os.Stdout = old
+	_ = w.Close()
+	var interrupted *commandError
+	if !errors.As(err, &interrupted) || interrupted.body.CheckID == "" {
+		t.Fatalf("error=%#v", err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return a.check(context.Background(), []string{"--force", "--profile=family", "--student=1234567"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	document, err := a.checkStateStore("family").Load(checkProfile{ID: "family", Origin: a.origin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(document.Events) != 1 || document.Events[0].CheckID != interrupted.body.CheckID {
+		t.Fatalf("events=%#v", document.Events)
 	}
 }
 
@@ -162,21 +232,42 @@ func TestCheckRejectsInconsistentIncompleteResult(t *testing.T) {
 	}
 }
 
+func TestCheckRefusesAndPreservesLegacyAccountHistory(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "changes.json")
+	original := []byte("{\"schema_version\":2}\n")
+	if err := os.WriteFile(legacy, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{dir: dir, origin: "https://portal.example", checker: scriptedCheckRunner{}}
+	err := a.check(context.Background(), []string{"--profile=family", "--student=1234567"})
+	var ce *commandError
+	if !errors.As(err, &ce) || ce.body.Reason != model.ReasonInvalidState || !strings.Contains(strings.ToLower(ce.body.Guidance.Action), "archive") {
+		t.Fatalf("error=%#v", err)
+	}
+	got, readErr := os.ReadFile(legacy)
+	if readErr != nil || !bytes.Equal(got, original) {
+		t.Fatalf("legacy=%q err=%v", got, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "profiles", "family", "check-state.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("new state created: %v", statErr)
+	}
+}
+
 func TestLiveCheckUsesCurrentParsersAndReportsIncompleteContinuity(t *testing.T) {
 	dir := t.TempDir()
 	a := &app{dir: dir, origin: "https://portal.example", client: &fakeClient{}}
 	data, err := captureStdout(t, func() error {
 		return a.check(context.Background(), []string{"--profile", "family", "--student", "1234567"})
 	})
-	var statusErr *exitStatus
-	if !errors.As(err, &statusErr) || statusErr.code != 3 {
+	if err != nil {
 		t.Fatalf("err=%#v", err)
 	}
 	var got checkResult
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Outcome != "incomplete" || got.Coverage[0].Continuity.Reason != "timeline_catch_up_not_implemented" || got.Baseline.ID != "" {
+	if got.Outcome != model.OutcomeInitialBaseline || got.Coverage[0].Continuity.Reason != "recent_baseline_established" || got.Baseline.ID == "" {
 		t.Fatalf("result=%#v", got)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "latest.json")); !os.IsNotExist(err) {
@@ -186,13 +277,16 @@ func TestLiveCheckUsesCurrentParsersAndReportsIncompleteContinuity(t *testing.T)
 
 func TestStatusIsLocalAndSeparatesLatestAttemptFromLastSuccess(t *testing.T) {
 	dir := t.TempDir()
-	success := checkResult{SchemaVersion: 3, CheckID: "ok", Outcome: "complete_without_changes", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{ID: "baseline-1", NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
-	failed := checkResult{SchemaVersion: 3, CheckID: "failed", Outcome: "failed", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Failure: &model.FailureSummary{Reason: "io"}}
+	coverage := []enrolmentCoverage{{EnrolmentID: "1234567", Sections: []sectionCoverage{{Name: "grades", State: "complete"}, {Name: "absences", State: "complete"}, {Name: "timeline", State: "complete"}}, Continuity: continuityCoverage{State: "complete"}}}
+	success := checkResult{SchemaVersion: 3, CheckID: "ok", Outcome: "complete_without_changes", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, Requested: []string{"1234567"}, Coverage: coverage, CompletedAt: time.Now(), Baseline: baselineReference{ID: "baseline-1", NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
+	failed := checkResult{SchemaVersion: 3, CheckID: "failed", Outcome: "failed", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, Requested: []string{"1234567"}, Coverage: []enrolmentCoverage{}, CompletedAt: time.Now(), Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Failure: &model.FailureSummary{Reason: "io"}}
 	a := &app{dir: dir, origin: "https://portal.example"}
-	if err := a.recordCheckStatus(success); err != nil {
+	stateStore := a.checkStateStore("family")
+	obs := []checkstate.Observation{{EnrolmentID: "1234567", Snapshot: model.StudentData{Student: model.Student{ID: "1234567"}}, TimelineBoundary: []string{}}}
+	if _, err := stateStore.Commit(success.Profile, success, obs); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.recordCheckStatus(failed); err != nil {
+	if _, err := stateStore.Commit(failed.Profile, failed, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, err := captureStdout(t, func() error { return a.status([]string{"--profile", "family"}) })
@@ -210,7 +304,7 @@ func TestStatusIsLocalAndSeparatesLatestAttemptFromLastSuccess(t *testing.T) {
 
 func TestRecordCheckStatusPreservesUnsupportedExistingState(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "profiles", "family", "check-status.json")
+	path := filepath.Join(dir, "profiles", "family", "check-state.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -220,8 +314,9 @@ func TestRecordCheckStatusPreservesUnsupportedExistingState(t *testing.T) {
 	}
 	a := &app{dir: dir, origin: "https://portal.example"}
 	result := checkResult{SchemaVersion: 3, CheckID: "new", Outcome: model.OutcomeIncomplete, Profile: checkProfile{ID: "family", Origin: a.origin}, Coverage: []enrolmentCoverage{}, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
-	var invalid *invalidCheckStatusError
-	if err := a.recordCheckStatus(result); !errors.As(err, &invalid) {
+	var invalid *checkstate.InvalidError
+	_, commitErr := a.checkStateStore("family").Commit(result.Profile, result, nil)
+	if err := commitErr; !errors.As(err, &invalid) {
 		t.Fatalf("err=%v", err)
 	}
 	got, err := os.ReadFile(path)
@@ -323,12 +418,26 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 || stderr.Len() != 0 {
+	if err != nil || stderr.Len() != 0 {
 		t.Fatalf("err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
 	}
-	var incomplete checkResult
-	if err := json.Unmarshal(stdout.Bytes(), &incomplete); err != nil || incomplete.Outcome != model.OutcomeIncomplete {
+	var initial checkResult
+	if err := json.Unmarshal(stdout.Bytes(), &initial); err != nil || initial.Outcome != model.OutcomeInitialBaseline {
 		t.Fatalf("stdout=%q err=%v", stdout.String(), err)
+	}
+	// Two real commands share the account lease and serialize generation writes.
+	concurrentErrs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			c := exec.Command(binary, "check", "--force", "--profile=family", "--student", "1234567")
+			c.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+configDir, "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+			concurrentErrs <- c.Run()
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-concurrentErrs; err != nil {
+			t.Fatalf("concurrent check: %v", err)
+		}
 	}
 	portalMode.Store("empty-grades")
 	cmd = exec.Command(binary, "grades", "--student", "1234567")
@@ -349,18 +458,12 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	if coordErr != nil {
 		t.Fatal(coordErr)
 	}
-	// Seed an earlier complete result and prove that source failures update only
-	// the latest attempt. The successful baseline remains available to status.
-	success := incomplete
-	success.CheckID = "known-good"
-	success.Outcome = model.OutcomeCompleteWithoutChanges
-	success.Coverage[0].Continuity = continuityCoverage{State: "complete"}
-	success.Baseline = baselineReference{ID: "baseline-known-good", NewEnrolments: []string{}}
-	status := checkStatus{SchemaVersion: checkSchemaVersion, History: "latest_attempt_only", LatestAttempt: &success, LastSuccess: &success}
-	statusPath := filepath.Join(coord.StateDir(), "check-status.json")
-	if err := store.SaveSnapshot(statusPath, status); err != nil {
-		t.Fatal(err)
+	statusPath := filepath.Join(coord.StateDir(), "check-state.json")
+	var beforeFailures checkstate.Document
+	if err := store.LoadSnapshot(statusPath, &beforeFailures); err != nil || beforeFailures.LastSuccess == nil {
+		t.Fatalf("state before failures=%#v err=%v", beforeFailures, err)
 	}
+	retainedSuccessID := beforeFailures.LastSuccess.CheckID
 	for _, mode := range []string{"maintenance", "success-only", "oversized"} {
 		portalMode.Store(mode)
 		cmd = exec.Command(binary, "check", "--force", "--profile", "family", "--student", "1234567")
@@ -376,8 +479,8 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 		if err := json.Unmarshal(stderr.Bytes(), &sourceErr); err != nil || sourceErr.Reason != model.ReasonInvalidSource || strings.Contains(stderr.String(), strings.Repeat("x", 32)) {
 			t.Fatalf("mode=%s stderr=%q err=%v", mode, stderr.String(), err)
 		}
-		var preserved checkStatus
-		if err := store.LoadSnapshot(statusPath, &preserved); err != nil || preserved.LastSuccess == nil || preserved.LastSuccess.Baseline.ID != "baseline-known-good" {
+		var preserved checkstate.Document
+		if err := store.LoadSnapshot(statusPath, &preserved); err != nil || preserved.LastSuccess == nil || preserved.LastSuccess.CheckID != retainedSuccessID {
 			t.Fatalf("mode=%s preserved=%#v err=%v", mode, preserved, err)
 		}
 	}
@@ -630,8 +733,8 @@ func TestCheckRefusesFutureAttemptTimestamp(t *testing.T) {
 	dir := t.TempDir()
 	profile := checkProfile{ID: "family", Origin: "https://portal.example"}
 	future := time.Now().UTC().Add(time.Hour)
-	prior := checkStatus{SchemaVersion: checkSchemaVersion, History: "latest_attempt_only", LatestAttempt: &checkResult{SchemaVersion: checkSchemaVersion, CheckID: "future", Outcome: model.OutcomeFailed, Profile: profile, Requested: []string{"1234567"}, Coverage: []enrolmentCoverage{}, StartedAt: future, CompletedAt: future, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: guidance{}, Failure: &model.FailureSummary{Reason: model.ReasonIO}}}
-	if err := store.SaveSnapshot(filepath.Join(dir, "profiles", "family", "check-status.json"), prior); err != nil {
+	prior := checkResult{SchemaVersion: checkSchemaVersion, CheckID: "future", Outcome: model.OutcomeFailed, Profile: profile, Requested: []string{"1234567"}, Coverage: []enrolmentCoverage{}, StartedAt: future, CompletedAt: future, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: guidance{}, Failure: &model.FailureSummary{Reason: model.ReasonIO}}
+	if _, err := (&app{dir: dir}).checkStateStore("family").Commit(profile, prior, nil); err != nil {
 		t.Fatal(err)
 	}
 	a := &app{dir: dir, origin: profile.Origin, checker: scriptedCheckRunner{}}

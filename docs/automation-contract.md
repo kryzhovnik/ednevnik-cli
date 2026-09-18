@@ -72,13 +72,13 @@ unknown absence statuses, and inconsistent timeline pagination are
 `invalid_source`; they are not silently omitted. Responses larger than 20 MiB
 are rejected before parsing, without returning a parsed prefix.
 
-Catch-up continuity is not yet
-implemented, so it returns `incomplete` with
-`timeline_catch_up_not_implemented` and does not commit a schema-v3 baseline.
-This is intentional: HTTP success and a parsed newest page do not establish
-continuity. Scripted adapters exercise all complete outcomes while the fetch,
-validation, and atomic-state slices are developed behind the same high-level
-check interface.
+Catch-up continuity is not yet implemented. A first or newly monitored
+enrolment establishes the explicit recent baseline described below. A later
+check commits only when the newest page overlaps its stored recent boundary,
+or both boundaries are empty. Otherwise it returns `incomplete` with
+`timeline_catch_up_not_implemented`. This is intentional: HTTP success and a
+parsed newest page alone do not establish continuity. Slice 06 extends the
+same runner and state seam with bounded page traversal.
 
 Synthetic fixtures cover the selectors and JSON shapes currently observed by
 the parsers, including empty `.flex-table` and `.categories-wrap` containers.
@@ -99,10 +99,19 @@ this inference for same-year transfers and closed enrolments before it is
 treated as real-portal compatibility evidence.
 
 `status --profile NAME` is local-only. It never contacts the portal or loads credentials. It
-reports `latest_attempt` separately from `last_success`. Until durable history
-lands, `history` is `latest_attempt_only`; with only legacy schema-v2 state it is
-`unavailable`. Plain `status` and `status --consumer` preserve their schema-v2
-shape during the transition.
+reports `latest_attempt` separately from `last_success`. A schema-v3 account
+reports `history: retained_events`; the current command does not expose those
+events yet. With no schema-v3 state, history is `unavailable`. Plain `status`
+and `status --consumer` preserve their schema-v2 shape during the transition.
+
+The first complete check establishes a bounded recent baseline from the
+validated overview, current absences, and newest timeline page. Existing
+records do not become events. A newly selected enrolment follows the same rule.
+For an existing enrolment, this storage slice advances the baseline only when
+the newest page overlaps its committed timeline boundary (including the
+empty-to-empty case). Otherwise the result is `incomplete` until bounded
+catch-up is implemented. This is recent-feed continuity, not all-history or
+historical-correction coverage.
 
 ## Downstream contracts
 
@@ -127,11 +136,21 @@ least once; external notification deduplication uses event IDs. These consumer
 and durable-journal mechanisms are contract requirements, not features of this
 intermediate implementation.
 
-Schema-v2 commands remain usable during the transition. A future storage slice
-must either migrate version-2 state transactionally while preserving the
-original for recovery, or refuse it with `invalid_state` and an actionable
-route. It must not fabricate unavailable history or reinterpret legacy
-`changes.json` as a durable journal. Legacy `sync --consumer` directories are
-separate baselines; later storage must migrate them into one account/profile and
-origin-bound journal with independent consumer cursors, or refuse ambiguous
-state. It must not keep fetching the portal once per consumer.
+Schema-v2 commands remain usable during the transition. Schema-v3 `check` and
+profile status deliberately refuse known root, per-consumer, namespaced-v2, or
+staged `check-status.json` state. The files are preserved. Archive or move the
+legacy files, then establish a new schema-v3 baseline. Legacy `changes.json`
+contains only the last diff, and older changes may already have been
+overwritten; the tool does not fabricate that unavailable history or reinterpret
+the file as a durable journal. Legacy per-consumer snapshots also cannot be
+merged safely because their baselines can differ.
+
+Schema-v3 account state is one generation file committed by a synced temporary
+file, atomic rename, and directory sync while the shared account lease is held.
+It contains per-enrolment baselines, retained ordered transition envelopes,
+latest attempt, and last success. Incomplete and failed attempts update only
+attempt evidence. Selected subsets do not replace unselected baselines.
+Transition envelopes include an event ID, sequence, revision, and producing
+check ID; slice 07 supplies final record semantics. There is no automatic event
+cleanup in this slice. Consumer retrieval, acknowledgement, and a finite
+retention policy remain slice 11 work.

@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kryzhovnik/ednevnik/internal/checkstate"
 	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/coordination"
 	"github.com/kryzhovnik/ednevnik/internal/credentials"
@@ -598,18 +599,14 @@ func (a *app) status(args []string) error {
 		if err := validateNamespace(*profile, "profile"); err != nil {
 			return err
 		}
-		var contractStatus checkStatus
-		err := store.LoadSnapshot(a.checkStatusPath(*profile), &contractStatus)
-		if os.IsNotExist(err) {
+		document, err := a.checkStateStore(*profile).Load(checkProfile{ID: *profile, Origin: a.origin})
+		if errors.Is(err, checkstate.ErrAbsent) {
 			return output(map[string]any{"schema_version": checkSchemaVersion, "history": "unavailable", "latest_attempt": nil, "last_success": nil})
 		}
 		if err != nil {
 			return newContractError("", model.ReasonInvalidState, err, false, "Preserve the file and repair or migrate local state.", 1)
 		}
-		if a.origin == "" || validateCheckStatus(contractStatus, *profile, a.origin) != nil {
-			return newContractError("", model.ReasonInvalidState, errors.New("status state has an unsupported schema or account/profile origin"), false, "Preserve the file and use the matching profile and portal origin, or migrate it explicitly.", 1)
-		}
-		return output(contractStatus)
+		return output(checkstate.Status(document))
 	}
 	stateDir, err := a.consumerDir(*consumer)
 	if err != nil {
@@ -634,11 +631,16 @@ func (a *app) status(args []string) error {
 	return output(map[string]any{"configured": true, "has_snapshot": true, "last_sync": snapshot.FetchedAt, "students": len(snapshot.Students), "request_budget": map[string]any{"date": date, "used": count, "limit": limit}})
 }
 
-func (a *app) checkStatusPath(profile string) string {
+func (a *app) checkStateStore(profile string) checkstate.Store {
+	base := filepath.Join(a.dir, "profiles", profile)
 	if a.accountDir != "" {
-		return filepath.Join(a.accountDir, "check-status.json")
+		base = a.accountDir
 	}
-	return filepath.Join(a.dir, "profiles", profile, "check-status.json")
+	legacy := []string{filepath.Join(a.dir, "latest.json"), filepath.Join(a.dir, "previous.json"), filepath.Join(a.dir, "changes.json"), filepath.Join(a.dir, "checks.jsonl"), filepath.Join(a.dir, "consumers"), filepath.Join(base, "check-status.json")}
+	if a.legacyDir != "" {
+		legacy = append(legacy, a.legacyDir)
+	}
+	return checkstate.Store{Path: filepath.Join(base, "check-state.json"), LegacyPaths: legacy}
 }
 
 func (a *app) localBudgetStatus() (string, int, int, error) {

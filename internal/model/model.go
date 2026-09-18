@@ -83,7 +83,10 @@ type Snapshot struct {
 }
 
 type Change struct {
-	Kind        string `json:"kind"`
+	Kind string `json:"kind"`
+	// RecordKey is a profile-local, enrolment-and-kind-namespaced identity set
+	// by semantic reconciliation when the source supports one.
+	RecordKey   string `json:"record_key,omitempty"`
 	StudentID   string `json:"student_id"`
 	StudentName string `json:"student_name"`
 	RecordID    string `json:"record_id"`

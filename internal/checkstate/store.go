@@ -1,0 +1,398 @@
+// Package checkstate owns the coherent account history document. Callers must
+// hold the account coordination lease for the full load/commit operation.
+package checkstate
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/kryzhovnik/ednevnik/internal/model"
+)
+
+const SchemaVersion = 3
+
+var commitTestHook func(stage string) error
+
+var ErrAbsent = errors.New("check state does not exist")
+
+type InvalidError struct{ Err error }
+
+func (e *InvalidError) Error() string { return "invalid check state: " + e.Err.Error() }
+func (e *InvalidError) Unwrap() error { return e.Err }
+
+// CommitError reports whether rename made the new generation visible. A
+// caller must never write a compensating failure generation when Committed is
+// true: later local status is the recovery interface for uncertain output.
+type CommitError struct {
+	Err       error
+	Committed bool
+}
+
+func (e *CommitError) Error() string { return e.Err.Error() }
+func (e *CommitError) Unwrap() error { return e.Err }
+
+type Observation struct {
+	EnrolmentID string            `json:"enrolment_id"`
+	Snapshot    model.StudentData `json:"snapshot"`
+	// TimelineBoundary holds source identities seen at the continuity seam.
+	// Slice 06 owns how it proves and advances this boundary.
+	TimelineBoundary []string `json:"timeline_boundary"`
+}
+
+type Baseline struct {
+	BaselineID       string            `json:"baseline_id"`
+	CheckID          string            `json:"check_id"`
+	Snapshot         model.StudentData `json:"snapshot"`
+	TimelineBoundary []string          `json:"timeline_boundary"`
+}
+
+type Document struct {
+	SchemaVersion int                   `json:"schema_version"`
+	Profile       model.CheckProfile    `json:"profile"`
+	Generation    uint64                `json:"generation"`
+	NextSequence  uint64                `json:"next_sequence"`
+	Baselines     map[string]Baseline   `json:"baselines"`
+	Events        []model.RetainedEvent `json:"events"`
+	LatestAttempt *model.CheckResult    `json:"latest_attempt"`
+	LastSuccess   *model.CheckResult    `json:"last_success"`
+}
+
+type Store struct {
+	Path        string
+	LegacyPaths []string
+}
+
+func (s Store) Load(profile model.CheckProfile) (Document, error) {
+	if legacy, err := legacyStateExists(s.LegacyPaths); err != nil {
+		return Document{}, err
+	} else if legacy {
+		return Document{}, &InvalidError{Err: errors.New("schema-v2 state is present; its last-diff and per-consumer histories cannot be migrated without loss; move it aside after archiving it, then establish a schema-v3 baseline")}
+	}
+	info, statErr := os.Lstat(s.Path)
+	if statErr == nil && (!info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0) {
+		return Document{}, &InvalidError{Err: errors.New("state file must be a private regular file with mode 0600")}
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return Document{}, statErr
+	}
+	b, err := os.ReadFile(s.Path)
+	if os.IsNotExist(err) {
+		return newDocument(profile), ErrAbsent
+	}
+	if err != nil {
+		return Document{}, err
+	}
+	var d Document
+	if err := json.Unmarshal(b, &d); err != nil {
+		return Document{}, &InvalidError{Err: err}
+	}
+	if err := validate(d, profile); err != nil {
+		return Document{}, &InvalidError{Err: err}
+	}
+	return d, nil
+}
+
+func newDocument(profile model.CheckProfile) Document {
+	return Document{SchemaVersion: SchemaVersion, Profile: profile, NextSequence: 1, Baselines: map[string]Baseline{}, Events: []model.RetainedEvent{}}
+}
+
+func validate(d Document, profile model.CheckProfile) error {
+	if d.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("unsupported schema version %d", d.SchemaVersion)
+	}
+	if d.Profile != profile {
+		return errors.New("profile or portal origin does not match")
+	}
+	if d.Generation == 0 || d.NextSequence == 0 || d.Baselines == nil || d.Events == nil || d.LatestAttempt == nil {
+		return errors.New("incomplete state envelope")
+	}
+	if err := validateResult(*d.LatestAttempt, profile, false); err != nil {
+		return fmt.Errorf("latest attempt: %w", err)
+	}
+	if d.LastSuccess != nil {
+		if err := validateResult(*d.LastSuccess, profile, true); err != nil {
+			return fmt.Errorf("last success: %w", err)
+		}
+	}
+	for id, baseline := range d.Baselines {
+		if id == "" || baseline.BaselineID == "" || baseline.CheckID == "" || baseline.Snapshot.Student.ID != id {
+			return fmt.Errorf("invalid baseline for enrolment %q", id)
+		}
+	}
+	last := uint64(0)
+	ids := map[string]bool{}
+	for _, e := range d.Events {
+		if e.ID == "" || e.Sequence <= last || e.Revision == 0 || e.CheckID == "" || ids[e.ID] || e.Change.Kind == "" || e.Change.StudentID == "" || (e.Change.RecordID == "" && e.Change.RecordKey == "") {
+			return errors.New("invalid retained event ordering")
+		}
+		last, ids[e.ID] = e.Sequence, true
+	}
+	if d.NextSequence <= last {
+		return errors.New("next event sequence does not follow retained events")
+	}
+	return nil
+}
+
+func validateResult(r model.CheckResult, profile model.CheckProfile, requireSuccess bool) error {
+	if r.SchemaVersion != SchemaVersion || r.CheckID == "" || r.Profile != profile || r.Requested == nil || r.Coverage == nil || r.Baseline.NewEnrolments == nil || r.Changes.Items == nil {
+		return errors.New("incomplete result envelope")
+	}
+	success := isSuccess(r.Outcome)
+	if requireSuccess && !success {
+		return errors.New("result is not successful")
+	}
+	if success && r.Baseline.ID == "" {
+		return errors.New("successful result has no baseline")
+	}
+	if !success && r.Outcome != model.OutcomeIncomplete && r.Outcome != model.OutcomeFailed {
+		return errors.New("unknown outcome")
+	}
+	if r.Outcome == model.OutcomeFailed && (r.Failure == nil || r.Failure.Reason == "") {
+		return errors.New("failed result has no reason")
+	}
+	requested := map[string]bool{}
+	for _, id := range r.Requested {
+		if id == "" || requested[id] {
+			return errors.New("invalid requested enrolments")
+		}
+		requested[id] = true
+	}
+	coverage := map[string]bool{}
+	for _, c := range r.Coverage {
+		if !requested[c.EnrolmentID] || coverage[c.EnrolmentID] {
+			return errors.New("coverage is not bound to a requested enrolment")
+		}
+		coverage[c.EnrolmentID] = true
+	}
+	if r.Outcome != model.OutcomeFailed && len(coverage) != len(requested) {
+		return errors.New("coverage does not contain every requested enrolment")
+	}
+	newIDs := map[string]bool{}
+	for _, id := range r.Baseline.NewEnrolments {
+		if !requested[id] || newIDs[id] {
+			return errors.New("invalid new enrolments")
+		}
+		newIDs[id] = true
+	}
+	if r.Changes.Count != len(r.Changes.Items) {
+		return errors.New("change count does not match items")
+	}
+	switch r.Outcome {
+	case model.OutcomeInitialBaseline:
+		if r.Changes.Count != 0 {
+			return errors.New("initial baseline contains changes")
+		}
+	case model.OutcomeCompleteWithChanges:
+		if r.Changes.Count == 0 {
+			return errors.New("changed result has no changes")
+		}
+	case model.OutcomeCompleteWithoutChanges:
+		if r.Changes.Count != 0 {
+			return errors.New("unchanged result contains changes")
+		}
+	case model.OutcomeIncomplete:
+		if r.Baseline.ID != "" || r.Baseline.PreviousID != "" || r.Changes.Count != 0 {
+			return errors.New("incomplete result claims committed data")
+		}
+	case model.OutcomeFailed:
+		if r.Baseline.ID != "" || r.Changes.Count != 0 {
+			return errors.New("failed result claims committed data")
+		}
+	}
+	return nil
+}
+
+func (s Store) Commit(profile model.CheckProfile, result model.CheckResult, observations []Observation) (Document, error) {
+	d, err := s.Load(profile)
+	if errors.Is(err, ErrAbsent) {
+		d = newDocument(profile)
+	} else if err != nil {
+		return Document{}, err
+	}
+	d.Generation++
+	resultCopy := result
+	d.LatestAttempt = &resultCopy
+	if isSuccess(result.Outcome) {
+		if err := applySuccess(&d, &resultCopy, observations); err != nil {
+			return Document{}, err
+		}
+		d.LatestAttempt = &resultCopy
+		d.LastSuccess = &resultCopy
+	}
+	if err := validate(d, profile); err != nil {
+		return Document{}, err
+	}
+	if err := writeAtomic(s.Path, d); err != nil {
+		return Document{}, err
+	}
+	return d, nil
+}
+
+func isSuccess(outcome string) bool {
+	return outcome == model.OutcomeInitialBaseline || outcome == model.OutcomeCompleteWithChanges || outcome == model.OutcomeCompleteWithoutChanges
+}
+
+func applySuccess(d *Document, result *model.CheckResult, observations []Observation) error {
+	byID := make(map[string]Observation, len(observations))
+	for _, o := range observations {
+		if o.EnrolmentID == "" || byID[o.EnrolmentID].EnrolmentID != "" {
+			return errors.New("invalid or duplicate observation")
+		}
+		byID[o.EnrolmentID] = o
+	}
+	for _, id := range result.Requested {
+		o, ok := byID[id]
+		if !ok {
+			return fmt.Errorf("missing observation for enrolment %s", id)
+		}
+		if o.Snapshot.Student.ID != id {
+			return fmt.Errorf("observation identity mismatch for enrolment %s", id)
+		}
+		d.Baselines[id] = Baseline{BaselineID: result.Baseline.ID, CheckID: result.CheckID, Snapshot: o.Snapshot, TimelineBoundary: append([]string(nil), o.TimelineBoundary...)}
+	}
+	if len(byID) != len(result.Requested) {
+		return errors.New("observation contains an unrequested enrolment")
+	}
+	if result.Outcome == model.OutcomeInitialBaseline || len(result.Baseline.NewEnrolments) > 0 {
+		// Existing records for a newly monitored enrolment establish state only.
+		newSet := map[string]bool{}
+		for _, id := range result.Baseline.NewEnrolments {
+			newSet[id] = true
+		}
+		for _, c := range result.Changes.Items {
+			if newSet[c.StudentID] {
+				return fmt.Errorf("new enrolment %s generated a historical event", c.StudentID)
+			}
+		}
+	}
+	for i := range result.Changes.Items {
+		c := result.Changes.Items[i]
+		revision := uint64(1)
+		for j := len(d.Events) - 1; j >= 0; j-- {
+			if sameRecord(d.Events[j].Change, c) {
+				revision = d.Events[j].Revision + 1
+				break
+			}
+		}
+		id := fmt.Sprintf("event_%s_%d", strings.TrimPrefix(result.CheckID, "check_"), i+1)
+		d.Events = append(d.Events, model.RetainedEvent{ID: id, Sequence: d.NextSequence, Revision: revision, CheckID: result.CheckID, Change: c})
+		d.NextSequence++
+	}
+	result.Changes.Count = len(result.Changes.Items)
+	return nil
+}
+
+func sameRecord(a, b model.Change) bool {
+	if a.RecordKey != "" && b.RecordKey != "" {
+		return a.StudentID == b.StudentID && a.RecordKey == b.RecordKey
+	}
+	return a.StudentID == b.StudentID && a.Kind == b.Kind && a.RecordID == b.RecordID
+}
+
+func legacyStateExists(paths []string) (bool, error) {
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		_, err := os.Stat(path)
+		if err == nil {
+			return true, nil
+		}
+		if !os.IsNotExist(err) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func writeAtomic(path string, value any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return &CommitError{Err: err}
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		return &CommitError{Err: err}
+	}
+	b, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return &CommitError{Err: err}
+	}
+	b = append(b, '\n')
+	name := filepath.Base(path) + ".tmp-" + randomSuffix()
+	tmp := filepath.Join(filepath.Dir(path), name)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return &CommitError{Err: err}
+	}
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err = io.Copy(f, strings.NewReader(string(b))); err != nil {
+		return &CommitError{Err: err}
+	}
+	if err = f.Sync(); err != nil {
+		return &CommitError{Err: err}
+	}
+	if err = f.Close(); err != nil {
+		return &CommitError{Err: err}
+	}
+	if commitTestHook != nil {
+		if err = commitTestHook("before_rename"); err != nil {
+			return &CommitError{Err: err}
+		}
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		return &CommitError{Err: err}
+	}
+	ok = true
+	if commitTestHook != nil {
+		if err = commitTestHook("after_rename"); err != nil {
+			return &CommitError{Err: err, Committed: true}
+		}
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return &CommitError{Err: err, Committed: true}
+	}
+	err = dir.Sync()
+	closeErr := dir.Close()
+	if err != nil {
+		return &CommitError{Err: err, Committed: true}
+	}
+	if closeErr != nil {
+		return &CommitError{Err: closeErr, Committed: true}
+	}
+	return nil
+}
+
+func randomSuffix() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", os.Getpid())
+	}
+	return hex.EncodeToString(b)
+}
+
+func Status(d Document) model.CheckStatus {
+	return model.CheckStatus{SchemaVersion: SchemaVersion, History: "retained_events", LatestAttempt: d.LatestAttempt, LastSuccess: d.LastSuccess}
+}
+
+func SortedBaselineIDs(d Document) []string {
+	ids := make([]string, 0, len(d.Baselines))
+	for id := range d.Baselines {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
