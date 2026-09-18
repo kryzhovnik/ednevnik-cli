@@ -137,6 +137,13 @@ func TestEmptySectionsRejectWrongEnrolmentAndTruncatedContainer(t *testing.T) {
 	if _, err := Absences([]byte(`<div class="categories-wrap">`), "1234567"); err == nil {
 		t.Fatal("truncated empty absences accepted")
 	}
+	subject := model.Subject{ID: "7654321", Name: "Math"}
+	if _, err := Grades([]byte(`<div class="categories-wrap" data-student-class-id="9999999"></div>`), "1234567", subject); err == nil {
+		t.Fatal("empty grade detail for another enrolment accepted")
+	}
+	if _, err := Grades([]byte(`<div class="categories-wrap">`), "1234567", subject); err == nil {
+		t.Fatal("truncated empty grade detail accepted")
+	}
 }
 
 func TestGenericPage(t *testing.T) {
@@ -210,6 +217,13 @@ func TestTimelineRejectsSuccessWithoutCoverageMetadata(t *testing.T) {
 		if _, err := Timeline(body, "1234567", 1); err == nil {
 			t.Fatalf("invalid timeline accepted: %s", body)
 		}
+	}
+}
+
+func TestTimelineRejectsUnsupportedSymbolValue(t *testing.T) {
+	body := []byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[{"items":[{"id":42,"title":"Math","itemType":"activity","symbolValue":{"value":"5"}}]}]}`)
+	if _, err := Timeline(body, "1234567", 1); err == nil {
+		t.Fatal("unsupported symbol value accepted")
 	}
 }
 

@@ -247,6 +247,9 @@ func Grades(body []byte, studentID string, subject model.Subject) ([]model.Grade
 	if doc.Find(`.categories-wrap, .category-item-wrap.grade`).Length() == 0 {
 		return nil, invalidSource("grade detail structure was not recognized")
 	}
+	if err := validateSuppliedEnrolment(doc, studentID, "grade detail"); err != nil {
+		return nil, err
+	}
 	if doc.Find(".category-item-wrap.grade:not(.numeric)").Length() > 0 {
 		return nil, invalidSource("grade detail contains an unsupported assessment form")
 	}
@@ -270,6 +273,9 @@ func Grades(body []byte, studentID string, subject model.Subject) ([]model.Grade
 	})
 	if invalid != "" {
 		return nil, invalidSource(invalid)
+	}
+	if len(grades) == 0 && !hasClosedClassElement(body, "categories-wrap") {
+		return nil, invalidSource("empty grade detail container is incomplete")
 	}
 	return grades, nil
 }
@@ -453,6 +459,9 @@ func Timeline(body []byte, studentID string, expectedPage ...int) (model.Activit
 				symbol = plainText(value)
 			case float64:
 				symbol = fmt.Sprintf("%g", value)
+			case nil:
+			default:
+				return model.ActivityPage{}, invalidSource("timeline item has an unsupported symbol value")
 			}
 			portalID := fmt.Sprintf("%d", item.ID)
 			if item.ID <= 0 || typeID == "" || plainText(item.Title) == "" {
