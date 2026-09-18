@@ -29,7 +29,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.1.0-dev"
+var version = "0.1.0-dev"
 
 type app struct {
 	client      siteClient

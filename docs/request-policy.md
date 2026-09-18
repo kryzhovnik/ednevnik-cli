@@ -37,27 +37,44 @@ locally until the cooldown expires. `--force` does not bypass this refusal.
 The defaults are project load controls, not a portal-published quota or operator
 approval:
 
-- 192 actual requests per UTC 24-hour window;
+- 192 actual requests per UTC calendar day;
 - 2.5 seconds between actual requests;
 - 30 minutes between checks;
 - 30 seconds to acquire the account lease;
 - 5 minutes for the whole command and 30 seconds per HTTP operation.
 
-The budget supports a documented five-enrolment workload. One nominal check is
-one discovery plus three requests per enrolment, or 16 requests. Four scheduled
-checks use 64. A login with a redirect uses up to three. A bounded catch-up may
-use eight extra timeline pages per enrolment, or 40. Two retry attempts for each
-of the 16 nominal reads add 32 in an adverse check. This totals 139 and leaves
-53 requests for command restarts and changed page shapes. At the default pace,
-the nominal plus 40-page catch-up takes about 140 seconds before response time,
-within the five-minute whole-command bound. Catch-up must still stop incomplete
-when its own page or elapsed-time bound is reached.
+The measured schema-v3 arithmetic for five explicit enrolments is:
+
+| Operation | Actual HTTP requests |
+| --- | ---: |
+| Initial baseline | 15: grade overview, absences, and timeline page 1 for each enrolment |
+| Unchanged known timelines | 20: the same 15 plus five timeline-head revalidations |
+| One enrolment needs one older timeline page | 21 |
+| Every enrolment reaches the eight-page limit without overlap | 50: two non-timeline reads plus eight timeline pages per enrolment; the incomplete path does not revalidate the head |
+| Automatic initial authentication before a check | 4 additional in the common redirect flow: login form GET, login POST, redirect GET, and separate protected verification |
+| Separate enrolment discovery | 1 additional; explicit `check --student ...` does not discover enrolments |
+
+A successful catch-up can use up to nine timeline requests per enrolment: eight
+inspected pages plus a page-1 revalidation. Every redirect and retry also counts
+as an actual request. The HTTP client can retry an eligible server failure twice,
+so automation must treat the 192-request default as a hard bound rather than a
+target. Four ordinary established five-enrolment checks use 80 requests. The
+remaining 112 cover authentication, catch-up, eligible retries, discovery, and
+operator commands, but no workload is guaranteed to fit after arbitrary retries
+or repeated failed runs. Catch-up and the daily policy refuse work before they
+allow unbounded traffic.
+
+At the default 2.5-second pace, 20 ordinary requests require at least 47.5
+seconds of pacing after the first request, before response time. The 50-request
+page-limit case requires at least 122.5 seconds and then returns incomplete. The
+per-enrolment two-minute catch-up bound and five-minute whole-command deadline
+still apply, so response latency can stop work earlier.
 
 `EDNEVNIK_DAILY_REQUEST_LIMIT`, `EDNEVNIK_REQUEST_INTERVAL`,
 `EDNEVNIK_MIN_CHECK_INTERVAL`, `EDNEVNIK_COORDINATION_WAIT`, and
-`EDNEVNIK_COMMAND_TIMEOUT` configure these values. Counts reset only after the
-next fixed UTC window boundary. Moving the clock backwards does not grant a new
-budget. `--force` has one narrow effect: it bypasses the local minimum check
+`EDNEVNIK_COMMAND_TIMEOUT` configure these values. Counts reset at the next UTC
+midnight. Moving the clock backwards does not grant a new budget. `--force` has
+one narrow effect: it bypasses the local minimum check
 interval. It never bypasses budget, pacing, server cooldown, validation, or
 command cancellation.
 

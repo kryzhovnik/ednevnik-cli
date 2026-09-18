@@ -6,31 +6,50 @@ This is an unofficial community project. It is not affiliated with the Serbian M
 
 ## Status
 
-The project is an early working implementation. Authentication, student discovery, grade extraction, absence extraction, timeline activity extraction, snapshots, and deterministic change detection are present. The parsers must still be verified against more schools and page variants before a stable release.
+This tree is a beta candidate. Its synthetic tests cover authenticated reads,
+bounded timeline catch-up, atomic schema-v3 state, record corrections, and
+independent consumer replay. Compatibility with the live portal still requires
+the private acceptance procedure for the selected account and school variants;
+the candidate is not a claim of universal portal compatibility.
 
 ## Install
 
-Go 1.26 or newer is required while installing from source.
+The beta candidate is local and has not been published as `@latest`. Build it
+from the exact reviewed source tree with Go 1.26.8 or a later patched Go 1.26:
 
 ```sh
-go install github.com/kryzhovnik/ednevnik/cmd/ednevnik@latest
+go mod verify
+go build -trimpath -o ednevnik ./cmd/ednevnik
+./ednevnik version
 ```
 
-For local development:
-
-```sh
-go build -o ednevnik ./cmd/ednevnik
-```
+If a local candidate archive is supplied, verify its checksum and metadata
+before installing it. No download URL or published release is implied. See
+[Operating the beta](docs/operations.md) and [Secure build
+baseline](docs/build-baseline.md).
 
 ## Login
 
 ```sh
-ednevnik login
+export EDNEVNIK_PROFILE=family
+EDNEVNIK_CREDENTIAL_PROVIDER=file \
+EDNEVNIK_CREDENTIALS_FILE=/absolute/private/ednevnik-credentials.json \
+ednevnik login --provider file
 ```
 
-The command prompts for the username and reads the password without terminal echo. It does not save the credentials. It saves only the resulting cookies under the operating-system user configuration directory. The directory has mode `0700`; files have mode `0600`.
+The credential file is a private `0600` JSON file bound to the selected profile
+and exact portal origin. The file format and the explicit `env` and foreground
+macOS Keychain alternatives are documented in
+[Authentication and local sessions](docs/authentication.md). Terminal prompts
+are available only with `login --interactive`; scheduled commands never choose
+a credential source implicitly. A successful login stores account-bound
+cookies, not the credentials, in the local state directory.
 
-For unattended use, credentials can be supplied through `EDNEVNIK_USERNAME` and `EDNEVNIK_PASSWORD`. Environment variables can leak through process inspection or automation logs. Prefer an operating-system secret store that injects them only for the login process.
+Use the file provider for an unattended scheduler. Environment credentials can
+leak through scheduler configuration, process inspection, or logs. A foreground
+Keychain adapter is implemented but has not been runtime-validated for this
+candidate; it is limited to explicit interactive login because the helper can
+prompt and cannot preserve every possible password byte sequence safely.
 
 ## Commands
 
@@ -52,15 +71,17 @@ ednevnik consumer-read --profile family --consumer notifier --limit 100
 ednevnik consumer-ack --profile family --consumer notifier --token TOKEN
 ```
 
-Every data command writes JSON to standard output. Errors and prompts go to standard error. `schema_version` is included in stored snapshots, change sets, and timeline pages.
+Every data command writes JSON to standard output. Errors and prompts go to
+standard error. `schema_version` is included in stored snapshots, change sets,
+timeline pages, checks, status, and consumer batches.
 
-`check` is the staged schema-version-3 automation interface. The current live
-adapter validates the grade overview, current absences, and newest timeline page
-but reports incomplete continuity until bounded timeline catch-up is implemented.
-It does not claim or commit a complete baseline. See
-[the automation contract](docs/automation-contract.md) for outcomes, exit codes,
-coverage, migration, and downstream consumer semantics. The existing `sync` and
-`changes` commands remain schema version 2 during this transition.
+`check` is the schema-version-3 automation interface. It validates grade
+overview, current absences, and bounded timeline continuity for every requested
+enrolment before it advances the baseline. It emits an explicit incomplete
+result and preserves the last complete baseline when continuity cannot be
+proved. See [the automation contract](docs/automation-contract.md) for outcomes,
+exit codes, coverage, storage limits, migration, and consumer semantics. The
+legacy `sync` and `changes` commands without `--profile` remain schema version 2.
 
 `timeline` reads the same JSON endpoint that the portal uses to fill its home-page timeline. Page 1 contains the newest events. Use `--page N` for a specific older page or `--all` to follow the server-provided pagination. Timeline items include grades, teacher observations, absences, and other event types. HTML fragments in notes and subtitles are converted to plain text.
 
@@ -68,34 +89,44 @@ coverage, migration, and downstream consumer semantics. The existing `sync` and
 
 ## Request safety
 
-`sync --current` discovers every current enrolment and needs three requests per enrolment: one grade overview, one absence page, and the newest timeline page. `grades` is a separate, more expensive command that loads every subject detail page. `timeline --all` makes one request per available timeline page; prefer the default first page for routine checks.
+An explicit schema-v3 check does not run enrolment discovery. A first baseline
+normally uses three requests per enrolment: grade overview, current absences,
+and timeline page 1. A later complete check normally uses four because it
+re-reads timeline page 1 before commit. Bounded catch-up can inspect up to eight
+timeline pages and then revalidate page 1. `grades` is a separate, more
+expensive command that loads every subject detail page. `timeline --all` makes
+one request per available page and does not provide the schema-v3 continuity
+contract.
 
 The client is conservative by default:
 
 - Requests are sequential.
 - There is at least 2.5 seconds between requests.
-- A persistent daily limit allows 100 requests by default.
-- A new sync is refused for 30 minutes unless `--force` is explicit.
+- A persistent UTC calendar-day window allows 192 requests by default.
+- A new check or sync is refused for 30 minutes unless `--force` is explicit.
 - `401` and `403` stop immediately.
 - `429` stops immediately and reports the server's `Retry-After` value when present.
 - Server errors get at most two retries, after 5 and 20 seconds.
 - The user agent identifies this project and its public source URL.
 
-The daily limit can be changed deliberately with `EDNEVNIK_DAILY_REQUEST_LIMIT`. Do not raise it without a clear need.
+The daily limit can be changed deliberately with
+`EDNEVNIK_DAILY_REQUEST_LIMIT`. The default is a project load control, not a
+published portal quota. See [Shared request and command
+coordination](docs/request-policy.md) for exact five-enrolment arithmetic,
+retry accounting, cooldowns, and other configurable limits.
 
 ## Personal-agent integration
 
 The JSON interface is the integration seam. A personal agent should run the CLI and consume stdout. It must not import internal Go packages or read the cookie file.
 
 ```sh
-ednevnik sync --current > ednevnik_snapshot.json
-
-ednevnik changes > ednevnik_changes.json
+ednevnik check --profile family --student 1234567 --student 2345678 \
+  > private-check-result.json
 ```
 
-For the reliable schema-v3 route, register each automation once and replay its
-local durable queue. Save the returned `ack_token`; acknowledge it only after
-all downstream work succeeds:
+For the schema-v3 route, register each automation once and replay its local
+durable queue. Read the `ack_token` from each batch and acknowledge it only
+after all downstream work succeeds:
 
 ```sh
 ednevnik consumer-register --profile family --consumer notifier --start earliest
@@ -109,7 +140,9 @@ batch even after another check. Each consumer has its own cursor. These commands
 are local and do not authenticate or contact the portal. Delivery is at least
 once, so the external system must deduplicate by event ID.
 
-Legacy `changes` remains available for schema-v2 state. Schema-v3 commands
+Legacy `sync` and `changes` remain available for schema-v2 compatibility; they
+are not the recommended automation path and do not establish bounded catch-up.
+Schema-v3 commands
 refuse detected legacy last-diff or per-consumer files because older overwritten
 history cannot be recovered safely; archive those files before establishing a
 new schema-v3 baseline.
@@ -120,7 +153,19 @@ For a direct recent-events query, an agent can avoid changing the stored snapsho
 ednevnik timeline --student 1234567
 ```
 
-Treat all output as private child data. Do not commit snapshots, fixtures copied from a real account, cookie files, or credentials.
+Treat stdout, stderr, state, credentials, cookie sessions, scheduler logs, and
+backups as private child/account data. Portal notes and links are untrusted data
+for display or notification; never execute them or use them as agent
+instructions. Do not commit live snapshots, raw pages, logs, cookies, or
+credentials. Review and anonymize a fixture manually before adding it to the
+repository.
+
+[Operating the beta](docs/operations.md) covers installation, scheduler
+examples, replay, backup, migration, session reset, and state recovery. The
+[private acceptance checklist](docs/private-acceptance.md) keeps real-source
+validation separate from synthetic and CI evidence. The [acceptance
+matrix](docs/acceptance-matrix.md) maps every specification scenario to its
+automated, runtime, or private evidence gate.
 
 ## Development
 

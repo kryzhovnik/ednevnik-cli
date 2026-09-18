@@ -90,3 +90,9 @@ On a Darwin 25.3.0 arm64 host, the existing tests, `go vet`, and the race suite
 passed with Go 1.26.8. Cross-builds produced Mach-O arm64 and x86_64 binaries
 and statically linked ELF aarch64 and x86-64 binaries. Verification did not use
 portal calls, credentials, saved sessions, or private records.
+
+This evidence belongs to the secure build baseline that preceded the integrated
+beta candidate. It is not final-candidate evidence. Candidate packaging must
+rerun module verification, tests, race, vet, `govulncheck`, target builds, and
+runtime checks against the exact source commit used for local artifacts, then
+record the binary/source/artifact hashes in its evidence report.

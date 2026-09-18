@@ -21,15 +21,16 @@ as monotonic. Items repeated on overlapping pages are retained once. Only the
 items before the first committed anchor on the overlap page can be new events;
 an unknown suffix is inspected for corrections but is treated as older history.
 
-Catch-up inspects at most eight pages and takes at most two minutes per
-enrolment. One of the eight requests beyond the normal newest-page read is
-reserved to re-read page one before commit. The re-read must have the same
-pagination extent and content. Changed pagination, a shifted head, or one
-identity carrying conflicting content makes coverage incomplete. This is
-observable stability evidence, not an atomic snapshot of the remote portal; a
-change outside the inspected pages can still happen without being visible.
-The two-minute context also bounds an in-flight page request and head
-revalidation.
+Catch-up inspects at most eight sequential pages and takes at most two minutes
+per enrolment. A successful existing-enrolment check then makes one additional
+request to re-read page 1 before commit. This means at most nine timeline
+requests per enrolment: the normal newest-page read, up to seven older pages,
+and the head revalidation. The re-read must have the same pagination extent and
+content. Changed pagination, a shifted head, or one identity carrying
+conflicting content makes coverage incomplete. This is observable stability
+evidence, not an atomic snapshot of the remote portal; a change outside the
+inspected pages can still happen without being visible. The two-minute context
+also bounds an in-flight page request and head revalidation.
 
 An exhausted page/time bound, a missing overlap at the source boundary, or a
 changing source returns `incomplete` with exit status 3. Request-budget refusal,

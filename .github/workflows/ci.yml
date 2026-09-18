@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - run: go mod verify
+      - run: go test -mod=readonly ./...
+      - run: go vet -mod=readonly ./...
+      - run: go test -mod=readonly -race ./...
+      - run: go build -mod=readonly -trimpath -o "$RUNNER_TEMP/ednevnik" ./cmd/ednevnik
+      - run: '"$RUNNER_TEMP/ednevnik" version'
+
+  vulnerability-scan:
+    name: Vulnerability scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - run: go mod verify
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - run: '"$(go env GOPATH)/bin/govulncheck" -show verbose ./...'
+
+  cross-build:
+    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - run: go mod verify
+      - name: Build target
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -mod=readonly -trimpath -o "$RUNNER_TEMP/ednevnik-${GOOS}-${GOARCH}" ./cmd/ednevnik

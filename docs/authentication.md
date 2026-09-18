@@ -15,12 +15,12 @@ is used for initial login and for one expired-session recovery attempt:
   manager can mount this file without copying it into eDnevnik state.
 - `env`: set both `EDNEVNIK_USERNAME` and `EDNEVNIK_PASSWORD` in the command
   environment. Missing or partial input fails; no other provider is tried.
-- `keychain`: supported only for an explicit foreground login on macOS. The
-  `security` command can require UI and its output cannot represent a password
-  ending in a newline without ambiguity. Unattended Keychain selection fails
-  before launching the helper. Use `file` or `env` for scheduled jobs. No
-  scheduler-context Keychain support is claimed without a synthetic runtime
-  test on the target Mac.
+- `keychain`: an adapter is implemented for explicit foreground login on macOS,
+  but it has not been runtime-validated for this candidate. The `security`
+  command can require UI and its output cannot represent a password ending in a
+  newline without ambiguity. Unattended Keychain selection fails before
+  launching the helper. Use `file` or `env` for scheduled jobs. No
+  scheduler-context Keychain support is claimed.
 
 `login --save` returns `credential_unavailable`: the `security` CLI cannot
 safely receive the verified password without exposing it as an argument, and
@@ -36,11 +36,15 @@ once and checked against the durable binding before the first portal request,
 even if the current cookie session is still valid. Configuring both environment
 and file input is a `credential_conflict` error.
 
-Use `ednevnik login --provider file` (or `env`) for a fresh explicit login.
-It discards the old cookie session before submitting the selected credentials,
-then verifies a protected page before saving the replacement. Authentication
-does one credential lookup, one login POST, and at most one replay of the safe
-read. CAPTCHA, MFA, eID, and browser-only flows return an actionable failure.
+Set `EDNEVNIK_PROFILE` to the same profile used by later checks, then use
+`ednevnik login --provider file` (or `env`) for a fresh explicit login. It
+discards the old cookie session before submitting the selected credentials,
+then verifies a protected page before saving the replacement. The common
+redirect flow makes four actual HTTP requests: login-form GET, credential POST,
+redirect GET, and a separate protected verification GET. Every redirect and
+retry is counted by the shared request policy. An expired-session recovery uses
+the selected provider at most once and then replays the interrupted safe read
+once. CAPTCHA, MFA, eID, and browser-only flows return an actionable failure.
 
 Use `ednevnik session-reset` to remove only local cookies. It preserves the
 durable account binding, diary baseline, retained events, and consumer state.
@@ -59,3 +63,8 @@ uses `EDNEVNIK_TEST_STATE_DIR` and the normal `EDNEVNIK_STATE_DIR` is ignored.
 Synthetic authentication uses `EDNEVNIK_TEST_USERNAME` and
 `EDNEVNIK_TEST_PASSWORD`, or `EDNEVNIK_TEST_CREDENTIALS_FILE`. It refuses the
 normal credential variables so a synthetic endpoint cannot inherit them.
+
+See [Operating the beta](operations.md) for private credential-file setup,
+launchd/systemd examples, session reset, and archive-first state recovery. The
+examples describe configuration only; scheduler execution requires separate
+runtime evidence on the selected host.

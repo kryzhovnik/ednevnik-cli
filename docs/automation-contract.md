@@ -48,18 +48,20 @@ The stable outcomes are:
 Incomplete results are JSON on standard output. Failed attempts are a JSON
 error object on standard error with `outcome: "failed"`, profile, requested
 enrolments, completed partial coverage, a stable `reason`, and
-retry/recovery guidance. Scripts must not parse `message`. Stable reasons are
+retry/recovery guidance. Scripts must not parse `message`. General reasons are
 `authentication_provider`, `refusal_quota`, `invalid_source`, `invalid_state`,
-`concurrency`, `cancelled`, `io`, and `invalid_argument`. Exit 2 means the
-invocation must be corrected. Exit 1 means an operational failure. `check` is
-always noninteractive. In this intermediate implementation it does
-not invoke Keychain or any other implicit credential lookup. The authentication
-slice will add explicit provider selection. Whole-command cancellation is
-`cancelled`; retrying starts a new check and cannot make the
-cancelled attempt successful.
+`storage_limit`, `concurrency`, `cancelled`, `io`, and `invalid_argument`.
+Credential selection can return the more specific `credential_missing`,
+`credential_malformed`, `credential_insecure`, `credential_unavailable`,
+`credential_conflict`, `credential_account_mismatch`, or
+`credential_account_unbound`. Exit 2 means the invocation must be corrected.
+Exit 1 means an operational failure. `check` is always noninteractive and uses
+only the provider explicitly named by `EDNEVNIK_CREDENTIAL_PROVIDER`; it never
+falls back to another source. Whole-command cancellation is `cancelled`;
+retrying starts a new check and cannot make the cancelled attempt successful.
 
-The current live adapter validates grade overview, current absences, and the
-newest timeline page through the real parsers. A valid empty grade overview
+The live adapter validates grade overview, current absences, and bounded
+timeline pages through the real parsers. A valid empty grade overview
 still has the observed grade-table container, and a valid empty absence page
 still has the observed categories container. The container must have an
 explicit closing tag, so a known truncated empty prefix is invalid. When the
@@ -72,13 +74,12 @@ unknown absence statuses, and inconsistent timeline pagination are
 `invalid_source`; they are not silently omitted. Responses larger than 20 MiB
 are rejected before parsing, without returning a parsed prefix.
 
-Catch-up continuity is not yet implemented. A first or newly monitored
-enrolment establishes the explicit recent baseline described below. A later
-check commits only when the newest page overlaps its stored recent boundary,
-or both boundaries are empty. Otherwise it returns `incomplete` with
-`timeline_catch_up_not_implemented`. This is intentional: HTTP success and a
-parsed newest page alone do not establish continuity. Slice 06 extends the
-same runner and state seam with bounded page traversal.
+For an existing enrolment, the runner follows sequential timeline pages until
+it overlaps the committed recent boundary or reaches a validated source
+boundary. It then re-reads page 1 before commit. Page/time exhaustion, a
+repeated page, a moving head, or an unproven boundary returns `incomplete` and
+leaves the prior successful baseline unchanged. This proves continuity only
+through the inspected bounded feed; it is not all-history coverage.
 
 Synthetic fixtures cover the selectors and JSON shapes currently observed by
 the parsers, including empty `.flex-table` and `.categories-wrap` containers.
@@ -98,20 +99,20 @@ established by the available fixtures. The private acceptance pass must verify
 this inference for same-year transfers and closed enrolments before it is
 treated as real-portal compatibility evidence.
 
-`status --profile NAME` is local-only. It never contacts the portal or loads credentials. It
-reports `latest_attempt` separately from `last_success`. A schema-v3 account
-reports `history: retained_events`; the current command does not expose those
-events yet. With no schema-v3 state, history is `unavailable`. Plain `status`
-and `status --consumer` preserve their schema-v2 shape during the transition.
+`status --profile NAME` is local-only. It never contacts the portal or loads
+credentials. It reports `latest_attempt` separately from `last_success`. A
+schema-v3 account reports `history: retained_events`; events are read through
+the local `consumer-read` command. With no schema-v3 state, history is
+`unavailable`. Plain `status` and `status --consumer` preserve their schema-v2
+shape during the transition.
 
 The first complete check establishes a bounded recent baseline from the
-validated overview, current absences, and newest timeline page. Existing
+validated overview, current absences, and inspected timeline pages. Existing
 records do not become events. A newly selected enrolment follows the same rule.
-For an existing enrolment, this storage slice advances the baseline only when
-the newest page overlaps its committed timeline boundary (including the
-empty-to-empty case). Otherwise the result is `incomplete` until bounded
-catch-up is implemented. This is recent-feed continuity, not all-history or
-historical-correction coverage.
+For an existing enrolment, the baseline advances only after bounded continuity
+and head stability are established. Otherwise the result is `incomplete`.
+This is recent-feed continuity, not all-history or historical-correction
+coverage.
 
 ## Downstream contracts
 
@@ -124,9 +125,9 @@ Record identity is namespaced by profile, enrolment, record kind, and stable
 source identity when available. Mutable content is not identity. Every
 committed transition receives a stable event ID and revision; a later change
 back to an old value is a new revision. Where source identity is unavailable,
-later work must preserve ambiguity and must not collapse equal-looking records.
-Source notes and links are untrusted data. They are never commands or agent
-instructions.
+fallback matching preserves multiplicity and emits explicit ambiguity instead
+of collapsing equal-looking records. Source notes and links are untrusted data.
+They are never commands or agent instructions.
 
 The implemented fallback, ambiguity, source labels, before/after fields, and
 deletion evidence rules are documented in
@@ -156,6 +157,7 @@ beta does not automatically delete journal or identity history. Reaching a
 limit refuses the check or consumer mutation without replacing the prior
 generation. Recovery requires a private archive and an explicitly chosen
 profile reset after unread events are accounted for; there is no silent loss.
+See [Operating the beta](operations.md) for the archive-first recovery flow.
 
 Schema-v2 commands remain usable during the transition. Schema-v3 `check` and
 profile status deliberately refuse known root, per-consumer, namespaced-v2, or
