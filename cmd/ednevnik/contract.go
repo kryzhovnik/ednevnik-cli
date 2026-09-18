@@ -311,15 +311,21 @@ func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkRun,
 		current.Sections = append(current.Sections, timeline.Section)
 		current.Continuity = timeline.Continuity
 		snapshot := model.StudentData{Student: model.Student{ID: id}, Subjects: subjects, Grades: []model.Grade{}, Absences: absences, Activities: timeline.Items}
+		unresolvedFallbackKeys := []string{}
+		seenSourceRecords := map[string]model.RecordState{}
 		if !timeline.Complete {
 			complete = false
 		} else if !known {
 			newEnrolments = append(newEnrolments, id)
+			reconciled := store.ReconcileWithState(model.Snapshot{}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}}, store.ReconcileOptions{Namespace: req.ProfileID + "\x00" + r.app.origin})
+			seenSourceRecords = reconciled.SeenSourceRecords
 		} else {
-			diff := store.Reconcile(model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{prior.Snapshot}}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}}, store.ReconcileOptions{Namespace: req.ProfileID + "\x00" + r.app.origin})
-			changes = append(changes, filterTimelineAdditions(diff.Items, timeline.NewIDs)...)
+			reconciled := store.ReconcileWithState(model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{prior.Snapshot}}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}}, store.ReconcileOptions{Namespace: req.ProfileID + "\x00" + r.app.origin, UnresolvedFallbackKeys: prior.UnresolvedFallbackKeys, SeenSourceRecords: prior.SeenSourceRecords})
+			changes = append(changes, filterTimelineAdditions(reconciled.Changes.Items, timeline.NewIDs)...)
+			unresolvedFallbackKeys = reconciled.UnresolvedFallbackKeys
+			seenSourceRecords = reconciled.SeenSourceRecords
 		}
-		observations = append(observations, checkstate.Observation{EnrolmentID: id, Snapshot: snapshot, TimelineBoundary: timeline.Boundary})
+		observations = append(observations, checkstate.Observation{EnrolmentID: id, Snapshot: snapshot, TimelineBoundary: timeline.Boundary, UnresolvedFallbackKeys: unresolvedFallbackKeys, SeenSourceRecords: seenSourceRecords})
 		coverage = append(coverage, current)
 	}
 	if !complete {

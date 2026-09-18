@@ -8,8 +8,8 @@ import (
 )
 
 func TestDiffReturnsOnlyNewRecords(t *testing.T) {
-	old := model.Snapshot{FetchedAt: time.Now(), Students: []model.StudentData{{Grades: []model.Grade{{ID: "old"}}}}}
-	current := model.Snapshot{Students: []model.StudentData{{Grades: []model.Grade{{ID: "old"}, {ID: "new", StudentID: "s1", Subject: "Math", Value: "5"}}}}}
+	old := model.Snapshot{FetchedAt: time.Now(), Students: []model.StudentData{{Grades: []model.Grade{{ID: "old", SourceID: "old"}}}}}
+	current := model.Snapshot{Students: []model.StudentData{{Grades: []model.Grade{{ID: "old", SourceID: "old"}, {ID: "new", SourceID: "new", StudentID: "s1", Subject: "Math", Value: "5"}}}}}
 	changes := Diff(old, current)
 	if len(changes.Items) != 1 || changes.Items[0].RecordID != "new" {
 		t.Fatalf("changes = %#v", changes)

@@ -15,13 +15,24 @@ subject identifier, date, and assessment kind for a grade. Value, status, and
 note remain mutable.
 
 Fallback matching preserves multiplicity. Equal-looking records are compared
-as a multiset rather than deduplicated. One unmatched prior and one unmatched
-current record in a fallback group form an update. Several unmatched records
+as a multiset rather than deduplicated. A singleton prior and singleton current
+record in a fallback group form an update. Several unmatched records
 on both sides produce an `*_ambiguous` change with all bounded before and after
-states. The tool does not guess a pairing. New equal-looking records receive
-separate occurrence keys. Older schema-v3 baselines whose parser IDs included
+states. A cardinality change in an existing fallback group is also ambiguous:
+DOM position is not treated as durable identity, even if unchanged content can
+be paired. The tool does not guess a pairing. Records first observed together
+receive separate occurrence keys, while only singleton 1-to-1 continuity uses
+that occurrence identity for later updates. Older schema-v3 baselines whose parser IDs included
 mutable content reconcile through the fallback fields, so they do not create a
 historical addition flood. Existing retained event IDs are not rewritten.
+Once a fallback group becomes ambiguous, its group key is retained with the
+baseline. Later singleton corrections stay ambiguous and cannot inherit an old
+occurrence lineage. A disappearance does not clear this marker because the
+source did not establish deletion; reappearance remains ambiguous. Explicit
+rebaselining or future stronger source identity can start a new lineage.
+The same marker is created when a previously unambiguous fallback group merely
+disappears from a source that cannot prove deletion. A later record at that
+anchor is therefore ambiguous rather than a new absence or an old occurrence.
 Revision lineage from early schema-v3 events without `RecordKey` is recovered
 only for absences, timeline activities, and overview subjects whose retained
 immutable fields support it. Old grade events lack the subject identifier,
@@ -46,3 +57,11 @@ complete. Reconciliation therefore emits no removal unless the caller
 explicitly supplies source-specific deletion-completeness evidence. Incomplete
 checks do not invoke successful reconciliation or advance the committed
 baseline.
+
+Stable source identities have a bounded last-known state in each enrolment
+baseline. It is seeded by the initial observation and is not removed when a
+record leaves a non-deletion-complete view. If that identity returns, the tool
+emits `*_reappeared` with meaning `observed_reappearance`, the same record key,
+and last-known/current context. This continues its retained revision lineage
+instead of reporting a new school record. Selected subsets preserve the other
+enrolment baselines, and incomplete checks do not replace this history.

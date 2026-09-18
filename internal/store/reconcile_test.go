@@ -86,6 +86,80 @@ func TestReconcileFallbackAdditionAndCorrectionShareRecordKey(t *testing.T) {
 	}
 }
 
+func TestReconcileFallbackInsertionDoesNotReuseExistingOccurrenceKey(t *testing.T) {
+	student := model.Student{ID: "enrolment-1"}
+	empty := model.StudentData{Student: student}
+	a := model.Absence{ID: "a", FallbackOrdinal: 1, StudentID: student.ID, Subject: "Math", Date: "date", Period: "2", Status: "unexcused", Note: "A"}
+	b := model.Absence{ID: "b", FallbackOrdinal: 1, StudentID: student.ID, Subject: "Math", Date: "date", Period: "2", Status: "excused", Note: "B"}
+	aMoved := a
+	aMoved.FallbackOrdinal = 2
+	before, after := snapshots(empty, model.StudentData{Student: student, Absences: []model.Absence{a}})
+	added := Reconcile(before, after, ReconcileOptions{Namespace: "family"}).Items
+	before, after = snapshots(model.StudentData{Student: student, Absences: []model.Absence{a}}, model.StudentData{Student: student, Absences: []model.Absence{b, aMoved}})
+	result := ReconcileWithState(before, after, ReconcileOptions{Namespace: "family"})
+	changed := result.Changes.Items
+	if len(added) != 1 || len(changed) != 1 || !changed[0].Ambiguous || changed[0].Kind != "absence_ambiguous" || added[0].RecordKey == changed[0].RecordKey || len(changed[0].Before) != 1 || len(changed[0].After) != 2 || len(result.UnresolvedFallbackKeys) != 1 {
+		t.Fatalf("added=%#v result=%#v", added, result)
+	}
+	bOnly := model.StudentData{Student: student, Absences: []model.Absence{b}}
+	before, after = snapshots(model.StudentData{Student: student, Absences: []model.Absence{b, aMoved}}, bOnly)
+	result = ReconcileWithState(before, after, ReconcileOptions{Namespace: "family", UnresolvedFallbackKeys: result.UnresolvedFallbackKeys})
+	if len(result.Changes.Items) != 1 || !result.Changes.Items[0].Ambiguous {
+		t.Fatalf("contraction=%#v", result)
+	}
+	bCorrected := b
+	bCorrected.Status = "unexcused"
+	before, after = snapshots(bOnly, model.StudentData{Student: student, Absences: []model.Absence{bCorrected}})
+	result = ReconcileWithState(before, after, ReconcileOptions{Namespace: "family", UnresolvedFallbackKeys: result.UnresolvedFallbackKeys})
+	if len(result.Changes.Items) != 1 || !result.Changes.Items[0].Ambiguous || result.Changes.Items[0].RecordKey != changed[0].RecordKey {
+		t.Fatalf("correction=%#v", result)
+	}
+	before, after = snapshots(model.StudentData{Student: student, Absences: []model.Absence{bCorrected}}, empty)
+	result = ReconcileWithState(before, after, ReconcileOptions{Namespace: "family", UnresolvedFallbackKeys: result.UnresolvedFallbackKeys})
+	if len(result.UnresolvedFallbackKeys) != 1 {
+		t.Fatalf("disappearance cleared uncertainty: %#v", result)
+	}
+	before, after = snapshots(empty, bOnly)
+	result = ReconcileWithState(before, after, ReconcileOptions{Namespace: "family", UnresolvedFallbackKeys: result.UnresolvedFallbackKeys})
+	if len(result.Changes.Items) != 1 || !result.Changes.Items[0].Ambiguous {
+		t.Fatalf("reappearance=%#v", result)
+	}
+}
+
+func TestReconcileFallbackDisappearanceMakesReappearanceAmbiguous(t *testing.T) {
+	student := model.Student{ID: "enrolment-1"}
+	empty := model.StudentData{Student: student}
+	a := model.Absence{ID: "a", FallbackOrdinal: 1, StudentID: student.ID, Subject: "Math", Date: "date", Period: "2", Status: "unexcused", Note: "A"}
+	b := model.Absence{ID: "b", FallbackOrdinal: 1, StudentID: student.ID, Subject: "Math", Date: "date", Period: "2", Status: "excused", Note: "B"}
+	before, after := snapshots(model.StudentData{Student: student, Absences: []model.Absence{a}}, empty)
+	disappeared := ReconcileWithState(before, after, ReconcileOptions{Namespace: "family"})
+	if len(disappeared.Changes.Items) != 0 || len(disappeared.UnresolvedFallbackKeys) != 1 {
+		t.Fatalf("disappeared=%#v", disappeared)
+	}
+	before, after = snapshots(empty, model.StudentData{Student: student, Absences: []model.Absence{b}})
+	reappeared := ReconcileWithState(before, after, ReconcileOptions{Namespace: "family", UnresolvedFallbackKeys: disappeared.UnresolvedFallbackKeys})
+	if len(reappeared.Changes.Items) != 1 || !reappeared.Changes.Items[0].Ambiguous || reappeared.Changes.Items[0].Kind != "absence_ambiguous" {
+		t.Fatalf("reappeared=%#v", reappeared)
+	}
+}
+
+func TestReconcileStableSourceReappearanceUsesKnownIdentity(t *testing.T) {
+	student := model.Student{ID: "enrolment-1"}
+	known := model.Absence{ID: "source-42", SourceID: "source-42", StudentID: student.ID, Subject: "Math", Date: "date", Period: "2", Status: "excused"}
+	current := model.StudentData{Student: student, Absences: []model.Absence{known}}
+	initial := ReconcileWithState(model.Snapshot{}, model.Snapshot{Students: []model.StudentData{current}}, ReconcileOptions{Namespace: "family"})
+	if len(initial.Changes.Items) != 0 || len(initial.SeenSourceRecords) != 1 {
+		t.Fatalf("initial=%#v", initial)
+	}
+	before, after := snapshots(current, model.StudentData{Student: student})
+	missing := ReconcileWithState(before, after, ReconcileOptions{Namespace: "family", SeenSourceRecords: initial.SeenSourceRecords})
+	before, after = snapshots(model.StudentData{Student: student}, current)
+	returned := ReconcileWithState(before, after, ReconcileOptions{Namespace: "family", SeenSourceRecords: missing.SeenSourceRecords})
+	if len(returned.Changes.Items) != 1 || returned.Changes.Items[0].Kind != "absence_reappeared" || returned.Changes.Items[0].Meaning != "observed_reappearance" || len(returned.Changes.Items[0].Before) != 1 || len(returned.Changes.Items[0].After) != 1 {
+		t.Fatalf("returned=%#v", returned)
+	}
+}
+
 func TestReconcileEqualLookingAdditionKeepsBothOccurrences(t *testing.T) {
 	student := model.Student{ID: "enrolment-1"}
 	grade := model.Grade{StudentID: student.ID, SubjectID: "math", Subject: "Math", Date: "date", Kind: "oral", Value: "5"}

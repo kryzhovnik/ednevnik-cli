@@ -13,9 +13,17 @@ import (
 )
 
 type ReconcileOptions struct {
-	Namespace            string
-	AllowGradeRemovals   bool
-	AllowAbsenceRemovals bool
+	Namespace              string
+	AllowGradeRemovals     bool
+	AllowAbsenceRemovals   bool
+	UnresolvedFallbackKeys []string
+	SeenSourceRecords      map[string]model.RecordState
+}
+
+type ReconcileResult struct {
+	Changes                model.Changes
+	UnresolvedFallbackKeys []string
+	SeenSourceRecords      map[string]model.RecordState
 }
 
 // Diff is the schema-v2 compatibility entry point. It never infers removals.
@@ -27,9 +35,21 @@ func Diff(old, current model.Snapshot) model.Changes {
 // fields form a fallback group. Multiplicity is retained and uncertain pairing
 // is reported as ambiguity instead of silently collapsing records.
 func Reconcile(old, current model.Snapshot, opts ReconcileOptions) model.Changes {
+	return ReconcileWithState(old, current, opts).Changes
+}
+
+func ReconcileWithState(old, current model.Snapshot, opts ReconcileOptions) ReconcileResult {
 	changes := model.Changes{SchemaVersion: model.SchemaVersion, ComparedAt: time.Now(), From: old.FetchedAt, To: current.FetchedAt, Items: []model.Change{}}
+	seen := cloneSeenRecords(opts.SeenSourceRecords)
 	if old.FetchedAt.IsZero() && len(old.Students) == 0 {
-		return changes
+		observeSourceRecords(current, opts.Namespace, seen)
+		return ReconcileResult{Changes: changes, UnresolvedFallbackKeys: []string{}, SeenSourceRecords: seen}
+	}
+	unresolved := map[string]bool{}
+	nextUnresolved := map[string]bool{}
+	for _, key := range opts.UnresolvedFallbackKeys {
+		unresolved[key] = true
+		nextUnresolved[key] = true
 	}
 	oldStudents := make(map[string]model.StudentData, len(old.Students))
 	for _, student := range old.Students {
@@ -40,12 +60,23 @@ func Reconcile(old, current model.Snapshot, opts ReconcileOptions) model.Changes
 		if !known {
 			continue
 		}
-		changes.Items = append(changes.Items, reconcileGrades(opts, before, now)...)
-		changes.Items = append(changes.Items, reconcileAbsences(opts, before, now)...)
-		changes.Items = append(changes.Items, reconcileActivities(opts, before, now)...)
+		gradeChanges, gradeUnresolved := reconcileGrades(opts, before, now, unresolved, seen)
+		absenceChanges, absenceUnresolved := reconcileAbsences(opts, before, now, unresolved, seen)
+		changes.Items = append(changes.Items, gradeChanges...)
+		changes.Items = append(changes.Items, absenceChanges...)
+		for _, key := range append(gradeUnresolved, absenceUnresolved...) {
+			nextUnresolved[key] = true
+		}
+		changes.Items = append(changes.Items, reconcileActivities(opts, before, now, seen)...)
 		changes.Items = append(changes.Items, reconcileOverview(opts, before, now)...)
 	}
-	return changes
+	keys := make([]string, 0, len(nextUnresolved))
+	for key := range nextUnresolved {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	observeSourceRecords(current, opts.Namespace, seen)
+	return ReconcileResult{Changes: changes, UnresolvedFallbackKeys: keys, SeenSourceRecords: seen}
 }
 
 type normalizedRecord struct {
@@ -54,7 +85,7 @@ type normalizedRecord struct {
 	state              model.RecordState
 }
 
-func reconcileGrades(opts ReconcileOptions, old, now model.StudentData) []model.Change {
+func reconcileGrades(opts ReconcileOptions, old, now model.StudentData, unresolved map[string]bool, seen map[string]model.RecordState) ([]model.Change, []string) {
 	a, b := map[string][]normalizedRecord{}, map[string][]normalizedRecord{}
 	for _, v := range old.Grades {
 		a[gradeAnchor(v)] = append(a[gradeAnchor(v)], normalizedGrade(v))
@@ -62,10 +93,10 @@ func reconcileGrades(opts ReconcileOptions, old, now model.StudentData) []model.
 	for _, v := range now.Grades {
 		b[gradeAnchor(v)] = append(b[gradeAnchor(v)], normalizedGrade(v))
 	}
-	return reconcileGroups(opts, old.Student, "grade", a, b, opts.AllowGradeRemovals)
+	return reconcileGroups(opts, old.Student, "grade", a, b, opts.AllowGradeRemovals, unresolved, seen)
 }
 
-func reconcileAbsences(opts ReconcileOptions, old, now model.StudentData) []model.Change {
+func reconcileAbsences(opts ReconcileOptions, old, now model.StudentData, unresolved map[string]bool, seen map[string]model.RecordState) ([]model.Change, []string) {
 	a, b := map[string][]normalizedRecord{}, map[string][]normalizedRecord{}
 	for _, v := range old.Absences {
 		a[absenceAnchor(v)] = append(a[absenceAnchor(v)], normalizedAbsence(v))
@@ -73,18 +104,42 @@ func reconcileAbsences(opts ReconcileOptions, old, now model.StudentData) []mode
 	for _, v := range now.Absences {
 		b[absenceAnchor(v)] = append(b[absenceAnchor(v)], normalizedAbsence(v))
 	}
-	return reconcileGroups(opts, old.Student, "absence", a, b, opts.AllowAbsenceRemovals)
+	return reconcileGroups(opts, old.Student, "absence", a, b, opts.AllowAbsenceRemovals, unresolved, seen)
 }
 
-func reconcileGroups(opts ReconcileOptions, student model.Student, kind string, old, now map[string][]normalizedRecord, allowRemoval bool) []model.Change {
+func reconcileGroups(opts ReconcileOptions, student model.Student, kind string, old, now map[string][]normalizedRecord, allowRemoval bool, unresolved map[string]bool, seen map[string]model.RecordState) ([]model.Change, []string) {
 	var out []model.Change
+	var nextUnresolved []string
 	for _, anchor := range unionKeys(old, now) {
 		originalOld, originalNow := old[anchor], now[anchor]
+		key := recordKey(opts.Namespace, student.ID, kind, anchor)
+		fallback := (len(originalOld) > 0 && originalOld[0].sourceID == "") || (len(originalNow) > 0 && originalNow[0].sourceID == "")
+		fallbackUncertain := fallback && unresolved[key]
+		if len(originalOld) == 0 && len(originalNow) == 1 && originalNow[0].sourceID != "" {
+			if previous, known := seen[key]; known {
+				out = append(out, makeChange(kind+"_reappeared", key, student, originalNow[0].recordID, "detail", "observed_reappearance", false, []model.RecordState{previous}, states(originalNow)))
+				continue
+			}
+		}
+		if fallbackUncertain && len(originalNow) > 0 {
+			a, b := cancelEqual(originalOld, originalNow)
+			if len(a) == 0 && len(b) == 0 {
+				nextUnresolved = append(nextUnresolved, key)
+				continue
+			}
+			out = append(out, makeChange(kind+"_ambiguous", key, student, "", "detail", "identity_ambiguous", true, states(originalOld), states(originalNow)))
+			nextUnresolved = append(nextUnresolved, key)
+			continue
+		}
+		if len(originalOld) > 0 && len(originalNow) > 0 && fallback && len(originalOld) != len(originalNow) {
+			out = append(out, makeChange(kind+"_ambiguous", key, student, "", "detail", "identity_ambiguous", true, states(originalOld), states(originalNow)))
+			nextUnresolved = append(nextUnresolved, key)
+			continue
+		}
 		a, b := cancelEqual(originalOld, originalNow)
 		if len(a) == 0 && len(b) == 0 {
 			continue
 		}
-		key := recordKey(opts.Namespace, student.ID, kind, anchor)
 		switch {
 		case len(a) == 1 && len(b) == 1 && (a[0].sourceID != "" || (len(originalOld) == 1 && len(originalNow) == 1)):
 			out = append(out, makeChange(kind+"_updated", occurrenceKey(opts, student.ID, kind, anchor, a[0], b[0]), student, b[0].recordID, "detail", "record_correction", false, states(a), states(b)))
@@ -105,12 +160,20 @@ func reconcileGroups(opts ReconcileOptions, student model.Student, kind string, 
 					}
 					out = append(out, makeChange(kind+"_removed", itemKey, student, item.recordID, "detail", "record_removed", false, []model.RecordState{item.state}, nil))
 				}
+			} else if fallback {
+				// Absence from an incomplete/current-window source is not deletion.
+				// Retain uncertainty so a later record at the same fallback anchor
+				// cannot inherit this occurrence lineage.
+				nextUnresolved = append(nextUnresolved, key)
 			}
 		default:
 			out = append(out, makeChange(kind+"_ambiguous", key, student, "", "detail", "identity_ambiguous", true, states(a), states(b)))
+			if originalOld[0].sourceID == "" {
+				nextUnresolved = append(nextUnresolved, key)
+			}
 		}
 	}
-	return out
+	return out, nextUnresolved
 }
 
 func cancelEqual(old, now []normalizedRecord) ([]normalizedRecord, []normalizedRecord) {
@@ -140,7 +203,7 @@ func cancelEqual(old, now []normalizedRecord) ([]normalizedRecord, []normalizedR
 	return remainingOld, remainingNow
 }
 
-func reconcileActivities(opts ReconcileOptions, old, now model.StudentData) []model.Change {
+func reconcileActivities(opts ReconcileOptions, old, now model.StudentData, seen map[string]model.RecordState) []model.Change {
 	known := map[string]model.Activity{}
 	for _, item := range old.Activities {
 		known[activitySource(item)] = item
@@ -152,7 +215,11 @@ func reconcileActivities(opts ReconcileOptions, old, now model.StudentData) []mo
 		before, ok := known[sourceID]
 		afterState := activityState(item)
 		if !ok {
-			out = append(out, makeChange("activity_added", key, now.Student, item.ID, "timeline", "timeline_activity", false, nil, []model.RecordState{afterState}))
+			if previous, observed := seen[key]; observed {
+				out = append(out, makeChange("activity_reappeared", key, now.Student, item.ID, "timeline", "observed_reappearance", false, []model.RecordState{previous}, []model.RecordState{afterState}))
+			} else {
+				out = append(out, makeChange("activity_added", key, now.Student, item.ID, "timeline", "timeline_activity", false, nil, []model.RecordState{afterState}))
+			}
 		} else if !equalState(activityState(before), afterState) {
 			out = append(out, makeChange("activity_updated", key, now.Student, item.ID, "timeline", "timeline_activity_correction", false, []model.RecordState{activityState(before)}, []model.RecordState{afterState}))
 		}
@@ -263,6 +330,34 @@ func activityState(v model.Activity) model.RecordState {
 func recordKey(namespace, enrolment, kind, source string) string {
 	sum := sha256.Sum256([]byte(strings.Join([]string{namespace, enrolment, kind, source}, "\x00")))
 	return kind + ":" + hex.EncodeToString(sum[:12])
+}
+
+func cloneSeenRecords(in map[string]model.RecordState) map[string]model.RecordState {
+	out := make(map[string]model.RecordState, len(in))
+	for key, state := range in {
+		out[key] = state
+	}
+	return out
+}
+
+func observeSourceRecords(snapshot model.Snapshot, namespace string, seen map[string]model.RecordState) {
+	for _, student := range snapshot.Students {
+		for _, grade := range student.Grades {
+			if grade.SourceID != "" {
+				seen[recordKey(namespace, student.Student.ID, "grade", gradeAnchor(grade))] = normalizedGrade(grade).state
+			}
+		}
+		for _, absence := range student.Absences {
+			if absence.SourceID != "" {
+				seen[recordKey(namespace, student.Student.ID, "absence", absenceAnchor(absence))] = normalizedAbsence(absence).state
+			}
+		}
+		for _, activity := range student.Activities {
+			if activity.PortalID > 0 {
+				seen[recordKey(namespace, student.Student.ID, "activity", activitySource(activity))] = activityState(activity)
+			}
+		}
+	}
 }
 func gradesKey(grades []string) string { raw, _ := json.Marshal(grades); return string(raw) }
 func unionKeys(a, b map[string][]normalizedRecord) []string {

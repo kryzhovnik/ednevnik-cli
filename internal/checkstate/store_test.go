@@ -147,6 +147,35 @@ func TestRevisionRecoversSafePreRecordKeyAbsenceLineage(t *testing.T) {
 	}
 }
 
+func TestSeenSourceRecordsSurviveSubsetAndIncompleteChecks(t *testing.T) {
+	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	initial := result(profile, "check_a", model.OutcomeInitialBaseline, "1111111", "2222222")
+	initial.Baseline.NewEnrolments = []string{"1111111", "2222222"}
+	obs := observations("1111111", "2222222")
+	obs[0].SeenSourceRecords = map[string]model.RecordState{"absence:key-a": {RecordID: "source-a", Status: "excused"}}
+	obs[1].SeenSourceRecords = map[string]model.RecordState{"absence:key-b": {RecordID: "source-b", Status: "unexcused"}}
+	if _, err := s.Commit(profile, initial, obs); err != nil {
+		t.Fatal(err)
+	}
+	subset := result(profile, "check_b", model.OutcomeCompleteWithoutChanges, "1111111")
+	subsetObs := observations("1111111")
+	subsetObs[0].SeenSourceRecords = obs[0].SeenSourceRecords
+	d, err := s.Commit(profile, subset, subsetObs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incomplete := result(profile, "check_c", model.OutcomeIncomplete, "1111111")
+	incomplete.Coverage[0].Continuity = model.ContinuityCoverage{State: "incomplete", Reason: "gap"}
+	d, err = s.Commit(profile, incomplete, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Baselines["1111111"].SeenSourceRecords) != 1 || len(d.Baselines["2222222"].SeenSourceRecords) != 1 {
+		t.Fatalf("baselines=%#v", d.Baselines)
+	}
+}
+
 func TestPostRenameFailureReportsCommittedGeneration(t *testing.T) {
 	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
 	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}

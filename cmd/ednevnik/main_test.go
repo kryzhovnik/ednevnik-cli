@@ -549,6 +549,18 @@ func TestProcessSuccessiveAbsenceCorrectionsRetainDistinctTransitions(t *testing
 				_, _ = w.Write([]byte(`<div class="categories-wrap"></div>`))
 				return
 			}
+			if status.Load() == "double" {
+				_, _ = w.Write([]byte(`<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap green"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Mathematics</div><div class="category-item-bottom-note">B</div></div><div class="category-item-wrap red"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Mathematics</div><div class="category-item-bottom-note">teacher note</div></div></div></div>`))
+				return
+			}
+			if status.Load() == "single_b" || status.Load() == "single_b_corrected" {
+				class := "green"
+				if status.Load() == "single_b_corrected" {
+					class = "red"
+				}
+				_, _ = fmt.Fprintf(w, `<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap %s"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Mathematics</div><div class="category-item-bottom-note">B</div></div></div></div>`, class)
+				return
+			}
 			_, _ = fmt.Fprintf(w, `<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap %s"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Mathematics</div><div class="category-item-bottom-note">teacher note</div></div></div></div>`, status.Load())
 		case "/timeline-data":
 			_, _ = w.Write([]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`))
@@ -607,6 +619,100 @@ func TestProcessSuccessiveAbsenceCorrectionsRetainDistinctTransitions(t *testing
 	}
 	if document.Events[1].Change.Before[0].Status != "unexcused" || document.Events[1].Change.After[0].Status != "excused" || document.Events[2].Change.After[0].Status != "unexcused" || document.Events[0].Change.RecordKey != document.Events[1].Change.RecordKey || document.Events[1].Change.RecordKey != document.Events[2].Change.RecordKey {
 		t.Fatalf("contexts=%#v", document.Events)
+	}
+	occurrenceKey := document.Events[0].Change.RecordKey
+	status.Store("double")
+	if got := run(true); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
+		t.Fatalf("insertion ambiguity=%#v", got)
+	}
+	status.Store("single_b")
+	if got := run(true); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
+		t.Fatalf("contraction ambiguity=%#v", got)
+	}
+	status.Store("single_b_corrected")
+	if got := run(true); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
+		t.Fatalf("continued ambiguity=%#v", got)
+	}
+	if err := store.LoadSnapshot(filepath.Join(coord.StateDir(), "check-state.json"), &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.Events) != 6 || document.Events[3].Change.RecordKey == occurrenceKey || document.Events[3].Change.RecordKey != document.Events[4].Change.RecordKey || document.Events[4].Change.RecordKey != document.Events[5].Change.RecordKey || document.Events[3].Revision != 1 || document.Events[4].Revision != 2 || document.Events[5].Revision != 3 || len(document.Baselines["1234567"].UnresolvedFallbackKeys) != 1 {
+		t.Fatalf("ambiguous continuation events=%#v baseline=%#v", document.Events, document.Baselines["1234567"])
+	}
+}
+
+func TestProcessStableAbsenceReappearanceContinuesIdentity(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	var mode atomic.Value
+	mode.Store("red")
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/grades":
+			_, _ = w.Write([]byte(`<div class="flex-table"></div>`))
+		case "/absents":
+			if mode.Load() == "missing" {
+				_, _ = w.Write([]byte(`<div class="categories-wrap"></div>`))
+				return
+			}
+			_, _ = fmt.Fprintf(w, `<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap %s" data-record-id="absence-42"><span class="category-symbol">2</span><span class="category-symbol-subtitle">hour</span><div class="name">Mathematics</div></div></div></div>`, mode.Load())
+		case "/timeline-data":
+			_, _ = w.Write([]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer portal.Close()
+	stateDir, testRoot := t.TempDir(), t.TempDir()
+	run := func(force bool) checkResult {
+		t.Helper()
+		args := []string{"check", "--profile=stable", "--student=1234567"}
+		if force {
+			args = append(args, "--force")
+		}
+		cmd := exec.Command(binary, args...)
+		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("check: %v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+		}
+		var got checkResult
+		if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	if got := run(false); got.Outcome != model.OutcomeInitialBaseline {
+		t.Fatalf("initial=%#v", got)
+	}
+	mode.Store("green")
+	updated := run(true)
+	if updated.Changes.Count != 1 || updated.Changes.Items[0].Kind != "absence_updated" {
+		t.Fatalf("updated=%#v", updated)
+	}
+	stableKey := updated.Changes.Items[0].RecordKey
+	mode.Store("missing")
+	if got := run(true); got.Outcome != model.OutcomeCompleteWithoutChanges {
+		t.Fatalf("missing=%#v", got)
+	}
+	mode.Store("green")
+	reappeared := run(true)
+	if reappeared.Changes.Count != 1 || reappeared.Changes.Items[0].Kind != "absence_reappeared" || reappeared.Changes.Items[0].Meaning != "observed_reappearance" || reappeared.Changes.Items[0].RecordKey != stableKey {
+		t.Fatalf("reappeared=%#v", reappeared)
+	}
+	coord, err := coordination.New(stateDir, coordination.Namespace{Profile: "stable", Origin: canonicalOrigin(portal.URL)}, coordination.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document checkstate.Document
+	if err := store.LoadSnapshot(filepath.Join(coord.StateDir(), "check-state.json"), &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.Events) != 2 || document.Events[0].Revision != 1 || document.Events[1].Revision != 2 || document.Events[0].Change.RecordKey != document.Events[1].Change.RecordKey || len(document.Baselines["1234567"].SeenSourceRecords) != 1 {
+		t.Fatalf("document=%#v", document)
 	}
 }
 

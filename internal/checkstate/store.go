@@ -45,14 +45,18 @@ type Observation struct {
 	Snapshot    model.StudentData `json:"snapshot"`
 	// TimelineBoundary holds source identities seen at the continuity seam.
 	// Slice 06 owns how it proves and advances this boundary.
-	TimelineBoundary []string `json:"timeline_boundary"`
+	TimelineBoundary       []string                     `json:"timeline_boundary"`
+	UnresolvedFallbackKeys []string                     `json:"unresolved_fallback_keys,omitempty"`
+	SeenSourceRecords      map[string]model.RecordState `json:"seen_source_records,omitempty"`
 }
 
 type Baseline struct {
-	BaselineID       string            `json:"baseline_id"`
-	CheckID          string            `json:"check_id"`
-	Snapshot         model.StudentData `json:"snapshot"`
-	TimelineBoundary []string          `json:"timeline_boundary"`
+	BaselineID             string                       `json:"baseline_id"`
+	CheckID                string                       `json:"check_id"`
+	Snapshot               model.StudentData            `json:"snapshot"`
+	TimelineBoundary       []string                     `json:"timeline_boundary"`
+	UnresolvedFallbackKeys []string                     `json:"unresolved_fallback_keys,omitempty"`
+	SeenSourceRecords      map[string]model.RecordState `json:"seen_source_records,omitempty"`
 }
 
 type Document struct {
@@ -126,6 +130,18 @@ func validate(d Document, profile model.CheckProfile) error {
 	for id, baseline := range d.Baselines {
 		if id == "" || baseline.BaselineID == "" || baseline.CheckID == "" || baseline.Snapshot.Student.ID != id {
 			return fmt.Errorf("invalid baseline for enrolment %q", id)
+		}
+		unresolved := map[string]bool{}
+		for _, key := range baseline.UnresolvedFallbackKeys {
+			if key == "" || unresolved[key] {
+				return fmt.Errorf("invalid unresolved record identity for enrolment %q", id)
+			}
+			unresolved[key] = true
+		}
+		for key, state := range baseline.SeenSourceRecords {
+			if key == "" || state.RecordID == "" {
+				return fmt.Errorf("invalid seen source identity for enrolment %q", id)
+			}
 		}
 	}
 	last := uint64(0)
@@ -257,7 +273,7 @@ func applySuccess(d *Document, result *model.CheckResult, observations []Observa
 		if o.Snapshot.Student.ID != id {
 			return fmt.Errorf("observation identity mismatch for enrolment %s", id)
 		}
-		d.Baselines[id] = Baseline{BaselineID: result.Baseline.ID, CheckID: result.CheckID, Snapshot: o.Snapshot, TimelineBoundary: append([]string(nil), o.TimelineBoundary...)}
+		d.Baselines[id] = Baseline{BaselineID: result.Baseline.ID, CheckID: result.CheckID, Snapshot: o.Snapshot, TimelineBoundary: append([]string(nil), o.TimelineBoundary...), UnresolvedFallbackKeys: append([]string(nil), o.UnresolvedFallbackKeys...), SeenSourceRecords: cloneRecordStates(o.SeenSourceRecords)}
 	}
 	if len(byID) != len(result.Requested) {
 		return errors.New("observation contains an unrequested enrolment")
@@ -303,6 +319,14 @@ func applySuccess(d *Document, result *model.CheckResult, observations []Observa
 	}
 	result.Changes.Count = len(result.Changes.Items)
 	return nil
+}
+
+func cloneRecordStates(in map[string]model.RecordState) map[string]model.RecordState {
+	out := make(map[string]model.RecordState, len(in))
+	for key, state := range in {
+		out[key] = state
+	}
+	return out
 }
 
 func sameRecord(a, b model.Change) bool {
