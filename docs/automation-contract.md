@@ -2,7 +2,7 @@
 
 The beta automation interface is `ednevnik check`. It emits schema version 3
 JSON on standard output. Diagnostics and structured command errors use standard
-error. Existing `sync`, `changes`, and their stored files remain schema version
+error. Existing `sync` without `--profile`, `changes`, and their stored files remain schema version
 2 during the staged transition. They are not silently interpreted as version 3.
 
 ```sh
@@ -154,3 +154,9 @@ Transition envelopes include an event ID, sequence, revision, and producing
 check ID; slice 07 supplies final record semantics. There is no automatic event
 cleanup in this slice. Consumer retrieval, acknowledgement, and a finite
 retention policy remain slice 11 work.
+
+`sync --profile NAME --student ID` is an explicit alias for the schema-v3
+reliable check and uses the same bounded timeline catch-up and coherent commit.
+`sync` without `--profile` retains schema-v2 output and storage compatibility;
+it reads only the newest timeline page and must not be used as evidence of
+complete catch-up. See [Timeline catch-up and coverage](timeline-catchup.md).

@@ -456,11 +456,25 @@ func (a *app) sync(ctx context.Context, args []string) error {
 	fs := commandFlagSet("sync")
 	var students stringList
 	fs.Var(&students, "student", "student enrolment ID; repeat for several students")
+	profile := fs.String("profile", "", "use the reliable schema-v3 check for this account/profile")
 	currentOnly := fs.Bool("current", false, "discover and sync every current enrolment")
 	force := fs.Bool("force", false, "bypass only the local minimum check interval")
 	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *profile != "" {
+		if *currentOnly || *consumer != "" {
+			return errors.New("sync --profile accepts explicit --student values only; --current and --consumer remain legacy schema-v2 options")
+		}
+		checkArgs := []string{"--profile", *profile}
+		if *force {
+			checkArgs = append(checkArgs, "--force")
+		}
+		for _, id := range students {
+			checkArgs = append(checkArgs, "--student", id)
+		}
+		return a.check(ctx, checkArgs)
 	}
 	if len(students) == 0 && !*currentOnly {
 		return errors.New("sync requires at least one --student; run `ednevnik students` to list IDs")
@@ -836,6 +850,7 @@ Usage:
   ednevnik page --path '/task-schedules?student=ID'
   ednevnik sync --current [--consumer NAME]
   ednevnik sync --student ID --student ID [--consumer NAME]
+  ednevnik sync --profile NAME --student ID [--student ID]
   ednevnik check --profile NAME --student ID [--student ID]
   ednevnik changes [--consumer NAME]
   ednevnik status [--profile NAME | --consumer NAME]

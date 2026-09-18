@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -264,7 +265,17 @@ func validateRequestedCoverage(result checkResult, requireComplete bool) error {
 	return nil
 }
 
-type liveCheckRunner struct{ app *app }
+type liveCheckRunner struct {
+	app *app
+	now func() time.Time
+}
+
+const (
+	// Seven older pages plus one head revalidation keep catch-up within the
+	// documented allowance of eight requests beyond the normal newest page.
+	timelineCatchUpPageLimit = 8
+	timelineCatchUpTimeLimit = 2 * time.Minute
+)
 
 func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkRun, error) {
 	coverage := make([]enrolmentCoverage, 0, len(req.Enrolments))
@@ -292,34 +303,27 @@ func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkRun,
 			return checkRun{}, invalidSourceFailure("absence response did not match the recognized source structure", coverage, current)
 		}
 		current.Sections = append(current.Sections, sectionCoverage{Name: "absences", State: "complete", Representation: "current_records"})
-		body, err = r.app.get(ctx, "/timeline-data?page=1&student="+id)
-		if err != nil {
-			return checkRun{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
-		}
-		page, err := parse.Timeline(body, id, 1)
-		if err != nil {
-			return checkRun{}, invalidSourceFailure("timeline response did not match the recognized source structure", coverage, current)
-		}
-		current.Sections = append(current.Sections, sectionCoverage{Name: "timeline", State: "complete", Representation: "newest_page"})
-		snapshot := model.StudentData{Student: model.Student{ID: id}, Subjects: subjects, Grades: []model.Grade{}, Absences: absences, Activities: page.Items}
-		boundary := activityIDs(page.Items)
 		prior, known := req.Prior[id]
-		if !known {
-			newEnrolments = append(newEnrolments, id)
-			current.Continuity = continuityCoverage{State: "complete", Reason: "recent_baseline_established"}
-		} else if hasTimelineOverlap(prior.TimelineBoundary, boundary) || (len(prior.TimelineBoundary) == 0 && len(boundary) == 0) {
-			current.Continuity = continuityCoverage{State: "complete"}
-			diff := store.Diff(model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{prior.Snapshot}}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}})
-			changes = append(changes, diff.Items...)
-		} else {
-			current.Continuity = continuityCoverage{State: "incomplete", Reason: "timeline_catch_up_not_implemented"}
-			complete = false
+		timeline, err := r.readTimeline(ctx, id, prior, known)
+		if err != nil {
+			return checkRun{}, withCurrentCoverage(err, coverage, current)
 		}
-		observations = append(observations, checkstate.Observation{EnrolmentID: id, Snapshot: snapshot, TimelineBoundary: boundary})
+		current.Sections = append(current.Sections, timeline.Section)
+		current.Continuity = timeline.Continuity
+		snapshot := model.StudentData{Student: model.Student{ID: id}, Subjects: subjects, Grades: []model.Grade{}, Absences: absences, Activities: timeline.Items}
+		if !timeline.Complete {
+			complete = false
+		} else if !known {
+			newEnrolments = append(newEnrolments, id)
+		} else {
+			diff := store.Diff(model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{prior.Snapshot}}, model.Snapshot{SchemaVersion: model.SchemaVersion, Students: []model.StudentData{snapshot}})
+			changes = append(changes, filterTimelineAdditions(diff.Items, timeline.NewIDs)...)
+		}
+		observations = append(observations, checkstate.Observation{EnrolmentID: id, Snapshot: snapshot, TimelineBoundary: timeline.Boundary})
 		coverage = append(coverage, current)
 	}
 	if !complete {
-		return checkRun{Result: checkResult{Outcome: model.OutcomeIncomplete, Coverage: coverage, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: guidance{Retryable: false, Action: "The last complete baseline remains committed. Timeline catch-up support is required before this observation can advance it."}}}, nil
+		return checkRun{Result: checkResult{Outcome: model.OutcomeIncomplete, Coverage: coverage, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: guidance{Retryable: true, Action: "The last complete baseline remains committed. Retry catch-up, or explicitly rebaseline if the portal can no longer expose the continuity boundary."}}}, nil
 	}
 	outcome := model.OutcomeCompleteWithoutChanges
 	if len(req.Prior) == 0 {
@@ -328,6 +332,152 @@ func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkRun,
 		outcome = model.OutcomeCompleteWithChanges
 	}
 	return checkRun{Result: checkResult{Outcome: outcome, Coverage: coverage, Baseline: baselineReference{ID: "baseline_" + strings.TrimPrefix(req.CheckID, "check_"), NewEnrolments: newEnrolments}, Changes: changeSummary{Count: len(changes), Items: changes}, Guidance: guidance{Action: "Committed retained events remain local until consumer replay is available."}}, Observations: observations}, nil
+}
+
+func filterTimelineAdditions(changes []model.Change, newIDs map[string]bool) []model.Change {
+	filtered := make([]model.Change, 0, len(changes))
+	for _, change := range changes {
+		if change.Kind != "activity_added" || newIDs[change.RecordID] {
+			filtered = append(filtered, change)
+		}
+	}
+	return filtered
+}
+
+type timelineRead struct {
+	Items      []model.Activity
+	Boundary   []string
+	NewIDs     map[string]bool
+	Section    sectionCoverage
+	Continuity continuityCoverage
+	Complete   bool
+}
+
+func (r liveCheckRunner) readTimeline(ctx context.Context, enrolmentID string, prior checkstate.Baseline, known bool) (timelineRead, error) {
+	started := r.nowTime()
+	catchCtx, cancel := context.WithTimeout(ctx, timelineCatchUpTimeLimit)
+	defer cancel()
+	items := []model.Activity{}
+	seen := map[string]model.Activity{}
+	newIDs := map[string]bool{}
+	seenPages := [][]model.Activity{}
+	firstBoundary := []string{}
+	firstPage := []model.Activity{}
+	lastPage := 0
+	pageNumber := 1
+	for {
+		if pageNumber > timelineCatchUpPageLimit {
+			return incompleteTimeline(items, "timeline_page_limit"), nil
+		}
+		if pageNumber > 1 && r.nowTime().Sub(started) >= timelineCatchUpTimeLimit {
+			return incompleteTimeline(items, "timeline_time_limit"), nil
+		}
+		body, err := r.app.get(catchCtx, fmt.Sprintf("/timeline-data?page=%d&student=%s", pageNumber, enrolmentID))
+		if err != nil {
+			if errors.Is(catchCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return incompleteTimeline(items, "timeline_time_limit"), nil
+			}
+			return timelineRead{}, liveReadFailure(err)
+		}
+		page, err := parse.Timeline(body, enrolmentID, pageNumber)
+		if err != nil {
+			return timelineRead{}, &checkFailure{Reason: model.ReasonInvalidSource, Err: errors.New("timeline response did not match the recognized source structure"), Action: "Keep the last successful baseline and inspect portal compatibility before retrying."}
+		}
+		pageIDs := activityIDs(page.Items)
+		if pageNumber == 1 {
+			firstBoundary = pageIDs
+			firstPage = append([]model.Activity{}, page.Items...)
+			lastPage = page.LastPage
+		} else if page.LastPage != lastPage {
+			return incompleteTimeline(items, "timeline_source_changed"), nil
+		}
+		for _, previousPage := range seenPages {
+			if reflect.DeepEqual(previousPage, page.Items) {
+				return incompleteTimeline(items, "timeline_repeated_page"), nil
+			}
+		}
+		seenPages = append(seenPages, append([]model.Activity{}, page.Items...))
+		for _, item := range page.Items {
+			if previous, exists := seen[item.ID]; exists {
+				if !reflect.DeepEqual(previous, item) {
+					return incompleteTimeline(items, "timeline_source_changed"), nil
+				}
+				continue
+			}
+			seen[item.ID] = item
+			items = append(items, item)
+		}
+		if pageNumber == 1 && !known {
+			return timelineRead{Items: items, Boundary: pageIDs, NewIDs: newIDs, Section: sectionCoverage{Name: "timeline", State: "complete", Representation: "recent_baseline_page"}, Continuity: continuityCoverage{State: "complete", Reason: "recent_baseline_established"}, Complete: true}, nil
+		}
+		boundary := activityIDs(page.Items)
+		overlaps := hasTimelineOverlap(prior.TimelineBoundary, boundary)
+		if overlaps {
+			markNewActivityPrefix(newIDs, page.Items, prior.TimelineBoundary)
+			return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, "caught_up_pages", "timeline_overlap_established")
+		}
+		for _, item := range page.Items {
+			newIDs[item.ID] = true
+		}
+		if len(prior.TimelineBoundary) == 0 && len(boundary) == 0 && page.NextPage == nil {
+			return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, "caught_up_to_source_boundary", "timeline_source_boundary_established")
+		}
+		if page.NextPage == nil {
+			if len(prior.TimelineBoundary) == 0 {
+				return r.completeStableTimeline(ctx, catchCtx, enrolmentID, items, firstPage, firstBoundary, newIDs, lastPage, started, "caught_up_to_source_boundary", "timeline_source_boundary_established")
+			}
+			return incompleteTimeline(items, "timeline_gap"), nil
+		}
+		pageNumber = *page.NextPage
+	}
+}
+
+func (r liveCheckRunner) nowTime() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func (r liveCheckRunner) completeStableTimeline(parentCtx, catchCtx context.Context, enrolmentID string, items, firstPage []model.Activity, boundary []string, newIDs map[string]bool, lastPage int, started time.Time, representation, reason string) (timelineRead, error) {
+	if r.nowTime().Sub(started) >= timelineCatchUpTimeLimit {
+		return incompleteTimeline(items, "timeline_time_limit"), nil
+	}
+	body, err := r.app.get(catchCtx, "/timeline-data?page=1&student="+enrolmentID)
+	if err != nil {
+		if errors.Is(catchCtx.Err(), context.DeadlineExceeded) && parentCtx.Err() == nil {
+			return incompleteTimeline(items, "timeline_time_limit"), nil
+		}
+		return timelineRead{}, liveReadFailure(err)
+	}
+	head, err := parse.Timeline(body, enrolmentID, 1)
+	if err != nil {
+		return timelineRead{}, &checkFailure{Reason: model.ReasonInvalidSource, Err: errors.New("timeline head revalidation did not match the recognized source structure"), Action: "Keep the last successful baseline and inspect portal compatibility before retrying."}
+	}
+	if head.LastPage != lastPage || !reflect.DeepEqual(head.Items, firstPage) {
+		return incompleteTimeline(items, "timeline_source_changed"), nil
+	}
+	if r.nowTime().Sub(started) >= timelineCatchUpTimeLimit {
+		return incompleteTimeline(items, "timeline_time_limit"), nil
+	}
+	return timelineRead{Items: items, Boundary: boundary, NewIDs: newIDs, Section: sectionCoverage{Name: "timeline", State: "complete", Representation: representation}, Continuity: continuityCoverage{State: "complete", Reason: reason}, Complete: true}, nil
+}
+
+func markNewActivityPrefix(newIDs map[string]bool, items []model.Activity, priorBoundary []string) {
+	known := make(map[string]bool, len(priorBoundary))
+	for _, id := range priorBoundary {
+		known[id] = true
+	}
+	for _, item := range items {
+		if known[item.ID] {
+			return
+		}
+		newIDs[item.ID] = true
+	}
+}
+
+func incompleteTimeline(items []model.Activity, reason string) timelineRead {
+	return timelineRead{Items: items, Section: sectionCoverage{Name: "timeline", State: "incomplete", Representation: "bounded_catch_up"}, Continuity: continuityCoverage{State: "incomplete", Reason: reason}}
 }
 
 func activityIDs(items []model.Activity) []string {
