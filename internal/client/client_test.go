@@ -1,13 +1,22 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
 )
+
+func TestReadResponseBodyRejectsOversizeWithoutReturningPrefix(t *testing.T) {
+	body, err := readResponseBody(bytes.NewReader(make([]byte, maxResponseBytes+1)))
+	if !errors.Is(err, ErrResponseTooLarge) || body != nil {
+		t.Fatalf("body length=%d err=%v", len(body), err)
+	}
+}
 
 func TestLoginPersistsSessionForNextClient(t *testing.T) {
 	mux := http.NewServeMux()

@@ -134,7 +134,7 @@ func (c *Client) get(ctx context.Context, path string, authenticated bool) ([]by
 		if err != nil {
 			return nil, nil, err
 		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+		body, readErr := readResponseBody(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
 			return nil, nil, readErr

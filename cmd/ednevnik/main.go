@@ -59,6 +59,11 @@ func main() {
 			_ = json.NewEncoder(os.Stderr).Encode(structured.body)
 			os.Exit(structured.code)
 		}
+		if errors.Is(err, parse.ErrInvalidSource) || errors.Is(err, client.ErrResponseTooLarge) {
+			failure := newContractError("", model.ReasonInvalidSource, errors.New("portal response did not match the recognized source structure"), false, "Keep the last valid snapshot and inspect portal compatibility before retrying.", 1)
+			_ = json.NewEncoder(os.Stderr).Encode(failure.body)
+			os.Exit(failure.code)
+		}
 		fallback := newContractError("", "io", err, true, "Retry after checking local configuration and I/O.", 1)
 		_ = json.NewEncoder(os.Stderr).Encode(fallback.body)
 		os.Exit(fallback.code)
@@ -242,7 +247,7 @@ func (a *app) subjects(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	subjects, err := parse.Subjects(body)
+	subjects, err := parse.Subjects(body, studentID)
 	if err != nil {
 		return err
 	}
@@ -254,7 +259,7 @@ func (a *app) loadGrades(ctx context.Context, studentID string) (model.StudentDa
 	if err != nil {
 		return model.StudentData{}, err
 	}
-	subjects, err := parse.Subjects(body)
+	subjects, err := parse.Subjects(body, studentID)
 	if err != nil {
 		return model.StudentData{}, err
 	}
@@ -331,7 +336,7 @@ func (a *app) loadTimeline(ctx context.Context, studentID string, page int) (mod
 	if err != nil {
 		return model.ActivityPage{}, err
 	}
-	return parse.Timeline(body, studentID)
+	return parse.Timeline(body, studentID, page)
 }
 
 func (a *app) page(ctx context.Context, args []string) error {
@@ -370,6 +375,13 @@ func (a *app) sync(ctx context.Context, args []string) error {
 	if len(students) > 0 && *currentOnly {
 		return errors.New("use either --current or explicit --student values, not both")
 	}
+	stateDir, err := a.consumerDir(*consumer)
+	if err != nil {
+		return err
+	}
+	latest := filepath.Join(stateDir, "latest.json")
+	var previous model.Snapshot
+	_ = store.LoadSnapshot(latest, &previous)
 	studentInfo := map[string]model.Student{}
 	if *currentOnly {
 		body, err := a.get(ctx, "/")
@@ -386,19 +398,24 @@ func (a *app) sync(ctx context.Context, args []string) error {
 				studentInfo[s.ID] = s
 			}
 		}
+		if len(students) == 0 {
+			return errors.New("no_current_enrolments: recognized family discovery contains no current enrolment")
+		}
+		discovered := make(map[string]bool, len(students))
+		for _, id := range students {
+			discovered[id] = true
+		}
+		for _, old := range previous.Students {
+			if old.Student.Current && !discovered[old.Student.ID] {
+				return fmt.Errorf("expected current enrolment %s was not discovered", old.Student.ID)
+			}
+		}
 	}
 	for _, id := range students {
 		if err := validateStudentID(id); err != nil {
 			return err
 		}
 	}
-	stateDir, err := a.consumerDir(*consumer)
-	if err != nil {
-		return err
-	}
-	latest := filepath.Join(stateDir, "latest.json")
-	var previous model.Snapshot
-	_ = store.LoadSnapshot(latest, &previous)
 	if !*force && !previous.FetchedAt.IsZero() && time.Since(previous.FetchedAt) < 30*time.Minute {
 		return fmt.Errorf("last sync was %s ago; wait 30 minutes or use --force deliberately", time.Since(previous.FetchedAt).Round(time.Second))
 	}
@@ -447,7 +464,7 @@ func (a *app) loadOverview(ctx context.Context, studentID string) (model.Student
 	if err != nil {
 		return model.StudentData{}, err
 	}
-	subjects, err := parse.Subjects(body)
+	subjects, err := parse.Subjects(body, studentID)
 	if err != nil {
 		return model.StudentData{}, err
 	}

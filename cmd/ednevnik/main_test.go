@@ -5,26 +5,35 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/model"
+	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
 )
 
-type fakeClient struct{ second bool }
+type fakeClient struct {
+	second  bool
+	invalid bool
+}
 
 func (f *fakeClient) Login(context.Context, string, string) error { return nil }
 func (f *fakeClient) BudgetStatus() (string, int, int, error)     { return "2026-09-12", 0, 100, nil }
 func (f *fakeClient) Get(_ context.Context, path string) ([]byte, error) {
 	if path == "/grades?student=1234567" {
+		if f.invalid {
+			return []byte(`<html><title>Maintenance</title></html>`), nil
+		}
 		grades := `<div class="grade numeric">4</div>`
 		if f.second {
 			grades += `<div class="grade numeric">5</div>`
@@ -32,7 +41,7 @@ func (f *fakeClient) Get(_ context.Context, path string) ([]byte, error) {
 		return []byte(`<a class="flex-table-row" href="/grades/7654321/show?student=1234567"><div><strong class="d-block">Mathematics</strong><em>Teacher</em></div><div class="grades-cell-wrap">` + grades + `</div></a>`), nil
 	}
 	if path == "/absents?student=1234567" {
-		return []byte(`<div class="categories-wrap"><div class="category-item-wrap green"><span class="category-symbol-subtitle">2. час</span><div class="name">Mathematics</div><div class="name-subtitle">8. септембар 2026.</div></div></div>`), nil
+		return []byte(`<div class="categories-wrap"><div class="category-wrap"><div class="category-top">08. 09. 2026.</div><div class="category-item-wrap green"><span class="category-symbol-subtitle">2. час</span><div class="name">Mathematics</div></div></div></div>`), nil
 	}
 	if path == "/timeline-data?page=1&student=1234567" {
 		return []byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`), nil
@@ -266,13 +275,27 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 		t.Fatalf("build: %v\n%s", err, output)
 	}
 
+	var portalMode atomic.Value
+	portalMode.Store("valid")
 	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/grades":
+			if portalMode.Load() == "maintenance" {
+				_, _ = w.Write([]byte(`<html><title>Maintenance</title></html>`))
+				return
+			}
+			if portalMode.Load() == "oversized" {
+				_, _ = w.Write(bytes.Repeat([]byte("x"), (20<<20)+1))
+				return
+			}
 			_, _ = w.Write([]byte(`<a class="flex-table-row" href="/grades/7654321/show?student=1234567"><div><strong class="d-block">Mathematics</strong></div></a>`))
 		case "/absents":
 			_, _ = w.Write([]byte(`<div class="categories-wrap"></div>`))
 		case "/timeline-data":
+			if portalMode.Load() == "success-only" {
+				_, _ = w.Write([]byte(`{"success":true,"data":[]}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`))
 		default:
 			http.NotFound(w, r)
@@ -301,7 +324,55 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 		t.Fatalf("stdout=%q err=%v", stdout.String(), err)
 	}
 
-	invalidPath := filepath.Join(stateDir, "profiles", "family", "check-status.json")
+	// Seed an earlier complete result and prove that source failures update only
+	// the latest attempt. The successful baseline remains available to status.
+	success := incomplete
+	success.CheckID = "known-good"
+	success.Outcome = model.OutcomeCompleteWithoutChanges
+	success.Coverage[0].Continuity = continuityCoverage{State: "complete"}
+	success.Baseline = baselineReference{ID: "baseline-known-good", NewEnrolments: []string{}}
+	status := checkStatus{SchemaVersion: checkSchemaVersion, History: "latest_attempt_only", LatestAttempt: &success, LastSuccess: &success}
+	statusPath := filepath.Join(stateDir, "profiles", "family", "check-status.json")
+	if err := store.SaveSnapshot(statusPath, status); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"maintenance", "success-only", "oversized"} {
+		portalMode.Store(mode)
+		cmd = exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
+		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+		stdout.Reset()
+		stderr.Reset()
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err = cmd.Run()
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout.Len() != 0 {
+			t.Fatalf("mode=%s err=%v stdout=%q stderr=%q", mode, err, stdout.String(), stderr.String())
+		}
+		var sourceErr contractError
+		if err := json.Unmarshal(stderr.Bytes(), &sourceErr); err != nil || sourceErr.Reason != model.ReasonInvalidSource || strings.Contains(stderr.String(), strings.Repeat("x", 32)) {
+			t.Fatalf("mode=%s stderr=%q err=%v", mode, stderr.String(), err)
+		}
+		var preserved checkStatus
+		if err := store.LoadSnapshot(statusPath, &preserved); err != nil || preserved.LastSuccess == nil || preserved.LastSuccess.Baseline.ID != "baseline-known-good" {
+			t.Fatalf("mode=%s preserved=%#v err=%v", mode, preserved, err)
+		}
+	}
+	portalMode.Store("maintenance")
+	cmd = exec.Command(binary, "subjects", "--student", "1234567")
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err = cmd.Run()
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout.Len() != 0 {
+		t.Fatalf("focused command err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	var focusedErr contractError
+	if err := json.Unmarshal(stderr.Bytes(), &focusedErr); err != nil || focusedErr.Reason != model.ReasonInvalidSource {
+		t.Fatalf("focused stderr=%q err=%v", stderr.String(), err)
+	}
+	portalMode.Store("valid")
+
+	invalidPath := statusPath
 	if err := os.WriteFile(invalidPath, []byte(`{"schema_version":99}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -397,6 +468,19 @@ func TestSyncWritesSnapshotAndChanges(t *testing.T) {
 	if !found {
 		t.Fatalf("changes=%#v", changes)
 	}
+	latest := filepath.Join(a.dir, "latest.json")
+	before, err := os.ReadFile(latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.invalid = true
+	if err := a.sync(context.Background(), []string{"--force", "--student", "1234567"}); !errors.Is(err, parse.ErrInvalidSource) {
+		t.Fatalf("invalid sync err=%v", err)
+	}
+	after, err := os.ReadFile(latest)
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("valid baseline changed after invalid source: err=%v", err)
+	}
 }
 
 func TestConsumerUsesIndependentStateDirectory(t *testing.T) {
@@ -427,6 +511,44 @@ func (f *timelineClient) Get(_ context.Context, path string) ([]byte, error) {
 		return []byte(`{"success":true,"meta":{"currentPage":2,"nextPage":null,"lastPage":2},"data":[{"date":{"day":"Sunday"},"items":[{"id":2,"title":"English","itemType":"activity"}]}]}`), nil
 	}
 	return nil, os.ErrNotExist
+}
+
+type discoveryClient struct{ home []byte }
+
+func (f *discoveryClient) Login(context.Context, string, string) error { return nil }
+func (f *discoveryClient) BudgetStatus() (string, int, int, error)     { return "2026-09-12", 0, 100, nil }
+func (f *discoveryClient) Get(_ context.Context, path string) ([]byte, error) {
+	if path == "/" {
+		return f.home, nil
+	}
+	return nil, fmt.Errorf("unexpected fetch %s", path)
+}
+
+func TestSyncCurrentRejectsMissingExpectedAndNoCurrentEnrolments(t *testing.T) {
+	dir := t.TempDir()
+	previous := model.Snapshot{SchemaVersion: model.SchemaVersion, FetchedAt: time.Now().Add(-time.Hour), Students: []model.StudentData{
+		{Student: model.Student{ID: "1111111", Current: true}},
+		{Student: model.Student{ID: "2222222", Current: true}},
+	}}
+	latest := filepath.Join(dir, "latest.json")
+	if err := store.SaveSnapshot(latest, previous); err != nil {
+		t.Fatal(err)
+	}
+	home := []byte(`<div class="card student"><div class="card-header"><h5>Child</h5></div><a class="student-school-class-wrap" href="/?student=1111111"><div class="student-school-class-item">School</div><div class="student-school-class-item school-class-strong">V a</div><div class="student-school-class-item">26/27</div></a></div>`)
+	a := &app{client: &discoveryClient{home: home}, dir: dir}
+	if err := a.sync(context.Background(), []string{"--current", "--force"}); err == nil || !strings.Contains(err.Error(), "2222222") {
+		t.Fatalf("missing expected enrolment err=%v", err)
+	}
+	var preserved model.Snapshot
+	if err := store.LoadSnapshot(latest, &preserved); err != nil || len(preserved.Students) != 2 {
+		t.Fatalf("preserved=%#v err=%v", preserved, err)
+	}
+
+	withdrawn := []byte(`<div class="card student"><div class="card-header"><h5>Child</h5></div><a class="student-school-class-wrap" href="/?student=1111111"><div class="student-school-class-item">School</div><div class="student-school-class-item school-class-strong">Исписан</div><div class="student-school-class-item">26/27</div></a></div>`)
+	a = &app{client: &discoveryClient{home: withdrawn}, dir: t.TempDir()}
+	if err := a.sync(context.Background(), []string{"--current", "--force"}); err == nil || !strings.Contains(err.Error(), "no_current_enrolments") {
+		t.Fatalf("no-current err=%v", err)
+	}
 }
 
 func TestTimelineLoadsAllPages(t *testing.T) {

@@ -236,9 +236,9 @@ func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkResu
 		current := enrolmentCoverage{EnrolmentID: id, Sections: []sectionCoverage{}, Continuity: continuityCoverage{State: "not_checked"}}
 		body, err := r.app.get(ctx, "/grades?student="+id)
 		if err != nil {
-			return checkResult{}, withCoverage(liveReadFailure(err), coverage)
+			return checkResult{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
 		}
-		if _, err := parse.Subjects(body); err != nil {
+		if _, err := parse.Subjects(body, id); err != nil {
 			return checkResult{}, invalidSourceFailure("grade overview did not match the recognized source structure", coverage, current)
 		}
 		current.Sections = append(current.Sections, sectionCoverage{Name: "grades", State: "complete", Representation: "overview"})
@@ -254,7 +254,7 @@ func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkResu
 		if err != nil {
 			return checkResult{}, withCurrentCoverage(liveReadFailure(err), coverage, current)
 		}
-		if _, err := parse.Timeline(body, id); err != nil {
+		if _, err := parse.Timeline(body, id, 1); err != nil {
 			return checkResult{}, invalidSourceFailure("timeline response did not match the recognized source structure", coverage, current)
 		}
 		current.Sections = append(current.Sections, sectionCoverage{Name: "timeline", State: "complete", Representation: "newest_page"})
@@ -270,6 +270,9 @@ func (r liveCheckRunner) Check(ctx context.Context, req checkRequest) (checkResu
 }
 
 func liveReadFailure(err error) error {
+	if errors.Is(err, client.ErrResponseTooLarge) {
+		return &checkFailure{Reason: model.ReasonInvalidSource, Err: errors.New("portal response exceeded the size limit"), Action: "Keep the last successful baseline and inspect the failing coverage before retrying."}
+	}
 	if errors.Is(err, client.ErrNotAuthenticated) {
 		return &checkFailure{Reason: "authentication_provider", Err: err, Action: "Select a supported credential provider and authenticate the configured profile."}
 	}

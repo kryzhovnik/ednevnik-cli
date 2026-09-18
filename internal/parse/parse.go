@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"net/url"
@@ -17,12 +18,16 @@ import (
 )
 
 var (
+	ErrInvalidSource = errors.New("portal source is invalid or unsupported")
+
 	studentIDPattern = regexp.MustCompile(`[?&]student=(\d+)`)
 	subjectIDPattern = regexp.MustCompile(`/grades/(\d+)/show`)
 	yearPattern      = regexp.MustCompile(`\b(\d{2})/(\d{2})\b`)
 	classPattern     = regexp.MustCompile(`\b([IVX]+\s*[[:alpha:]А-Яа-я])\b`)
 	datePattern      = regexp.MustCompile(`\b\d{2}\s*\.\s*\d{2}\s*\.\s*\d{4}\s*\.`)
 )
+
+func invalidSource(message string) error { return fmt.Errorf("%w: %s", ErrInvalidSource, message) }
 
 type Link struct {
 	Text        string `json:"text"`
@@ -74,6 +79,7 @@ func Students(body []byte, currentID string) ([]model.Student, error) {
 		currentID, _ = doc.Find("timeline").First().Attr(":student-class-id")
 	}
 	byID := map[string]model.Student{}
+	invalid := ""
 	doc.Find(`a.student-school-class-wrap`).Each(func(_ int, s *goquery.Selection) {
 		href, _ := s.Attr("href")
 		match := studentIDPattern.FindStringSubmatch(href)
@@ -84,15 +90,13 @@ func Students(body []byte, currentID string) ([]model.Student, error) {
 			id = currentID
 		}
 		if id == "" {
+			invalid = "student entry has no enrolment identifier"
 			return
 		}
 		card := s.Closest(".card.student")
 		name := clean(card.Find(".card-header h5").First().Clone().Children().Remove().End().Text())
 		items := selectionTexts(s.Find(".student-school-class-item"))
 		text := strings.Join(items, " ")
-		if old, exists := byID[id]; exists && old.Name != "" {
-			return
-		}
 		student := model.Student{ID: id, Name: name, Selected: id == currentID}
 		if len(items) > 0 {
 			student.School = items[0]
@@ -109,8 +113,19 @@ func Students(body []byte, currentID string) ([]model.Student, error) {
 			student.Name = clean(yearPattern.ReplaceAllString(text, ""))
 			student.Name = strings.TrimSpace(strings.Trim(student.Name, "()-"))
 		}
+		if student.Name == "" || student.School == "" || student.SchoolYear == "" || student.Class == "" {
+			invalid = "student entry is missing name, school, class, or school year"
+			return
+		}
+		if old, exists := byID[id]; exists && old != student {
+			invalid = "enrolment identifier appears with conflicting student data"
+			return
+		}
 		byID[id] = student
 	})
+	if invalid != "" {
+		return nil, invalidSource("invalid student discovery: " + invalid)
+	}
 	students := make([]model.Student, 0, len(byID))
 	for _, s := range byID {
 		students = append(students, s)
@@ -134,7 +149,7 @@ func Students(body []byte, currentID string) ([]model.Student, error) {
 		return students[i].SchoolYear > students[j].SchoolYear
 	})
 	if len(students) == 0 {
-		return nil, fmt.Errorf("no students found; page layout may have changed")
+		return nil, invalidSource("no students found; page layout may have changed")
 	}
 	return students, nil
 }
@@ -149,17 +164,27 @@ func selectionTexts(selection *goquery.Selection) []string {
 	return out
 }
 
-func Subjects(body []byte) ([]model.Subject, error) {
+func Subjects(body []byte, expectedEnrolment ...string) ([]model.Subject, error) {
 	doc, err := Document(body)
 	if err != nil {
 		return nil, err
 	}
 	var subjects []model.Subject
+	invalid := ""
+	recognized := doc.Find(`.flex-table, .grades-wrap, a[href*="/grades/"][href*="/show"]`).Length() > 0
 	doc.Find(`a[href*="/grades/"][href*="/show"]`).Each(func(_ int, s *goquery.Selection) {
 		href, _ := s.Attr("href")
 		m := subjectIDPattern.FindStringSubmatch(href)
 		if len(m) != 2 {
+			invalid = "subject link has no subject identifier"
 			return
+		}
+		if len(expectedEnrolment) > 0 && expectedEnrolment[0] != "" {
+			u, err := url.Parse(href)
+			if err != nil || u.Query().Get("student") != expectedEnrolment[0] {
+				invalid = "subject link does not identify the requested enrolment"
+				return
+			}
 		}
 		text := clean(s.Find("strong.d-block").First().Text())
 		teacher := clean(s.Find("em").First().Text())
@@ -172,10 +197,21 @@ func Subjects(body []byte) ([]model.Subject, error) {
 				text = clean(label)
 			}
 		}
+		if text == "" {
+			invalid = "subject entry has no name"
+			return
+		}
+		if s.Find(".grades-cell-wrap .grade:not(.numeric)").Length() > 0 {
+			invalid = "grade overview contains an unsupported assessment form"
+			return
+		}
 		subjects = append(subjects, model.Subject{ID: m[1], Name: text, Teacher: teacher, DisplayedGrades: displayedGrades})
 	})
-	if len(subjects) == 0 {
-		return nil, fmt.Errorf("no subjects found; page layout may have changed")
+	if invalid != "" {
+		return nil, invalidSource(invalid)
+	}
+	if !recognized {
+		return nil, invalidSource("grade overview structure was not recognized")
 	}
 	return dedupeSubjects(subjects), nil
 }
@@ -186,18 +222,33 @@ func Grades(body []byte, studentID string, subject model.Subject) ([]model.Grade
 		return nil, err
 	}
 	grades := []model.Grade{}
+	if doc.Find(`.categories-wrap, [data-section="grade-details"], .category-item-wrap.grade`).Length() == 0 {
+		return nil, invalidSource("grade detail structure was not recognized")
+	}
+	if doc.Find(".category-item-wrap.grade:not(.numeric)").Length() > 0 {
+		return nil, invalidSource("grade detail contains an unsupported assessment form")
+	}
+	invalid := ""
 	doc.Find(".category-item-wrap.grade.numeric").Each(func(_ int, item *goquery.Selection) {
 		value := clean(item.Find(".category-symbol").First().Clone().Children().Remove().End().Text())
 		if !regexp.MustCompile(`^[1-5]$`).MatchString(value) {
+			invalid = "numeric grade has an unsupported value"
 			return
 		}
 		dateText := item.Find(".name-subtitle").First().Clone().Children().Remove().End().Text()
 		date := clean(datePattern.FindString(dateText))
+		if date == "" || studentID == "" || subject.ID == "" || subject.Name == "" {
+			invalid = "grade record is missing an essential identifier or date"
+			return
+		}
 		kind := strings.TrimSpace(strings.TrimPrefix(clean(item.Find(".name-subtitle-suffix").First().Text()), "•"))
 		note := clean(item.Find(".category-item-bottom-note").First().Text())
 		id := stableID(studentID, subject.ID, value, date, kind, note)
 		grades = append(grades, model.Grade{ID: id, StudentID: studentID, SubjectID: subject.ID, Subject: subject.Name, Value: value, Kind: kind, Date: date, Note: note})
 	})
+	if invalid != "" {
+		return nil, invalidSource(invalid)
+	}
 	return grades, nil
 }
 
@@ -206,7 +257,24 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 	if err != nil {
 		return nil, err
 	}
+	if doc.Find(`.categories-wrap, [data-section="absences"]`).Length() == 0 {
+		return nil, invalidSource("absence structure was not recognized")
+	}
+	for _, attribute := range []string{"data-student-class-id", ":student-class-id"} {
+		doc.Find("*").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+			value, _ := s.Attr(attribute)
+			if value != "" && value != studentID {
+				err = invalidSource("absence page identifies a different enrolment")
+				return false
+			}
+			return true
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	var out []model.Absence
+	invalid := ""
 	doc.Find(".categories-wrap .category-item-wrap").Each(func(_ int, s *goquery.Selection) {
 		subject := clean(s.Find(".name").First().Text())
 		dateText := clean(s.Closest(".category-wrap").Find(".category-top").First().Text())
@@ -214,7 +282,8 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 		periodNumber := clean(s.Find(".category-symbol").First().Clone().Children().Remove().End().Text())
 		period := clean(periodNumber + " " + s.Find(".category-symbol-subtitle").First().Text())
 		note := clean(s.Find(".category-item-bottom-note").First().Text())
-		if subject == "" && date == "" {
+		if subject == "" || date == "" || period == "" || studentID == "" {
+			invalid = "absence record is missing an essential field"
 			return
 		}
 		status := "unknown"
@@ -224,9 +293,16 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 		case s.HasClass("green"):
 			status = "excused"
 		}
+		if status == "unknown" {
+			invalid = "absence record has an unsupported status"
+			return
+		}
 		id := stableID(studentID, subject, date, period, status, note)
 		out = append(out, model.Absence{ID: id, StudentID: studentID, Subject: subject, Date: date, Period: period, Status: status, Note: note})
 	})
+	if invalid != "" {
+		return nil, invalidSource(invalid)
+	}
 	return dedupeAbsences(out), nil
 }
 
@@ -237,39 +313,66 @@ type timelineResponse struct {
 		NextPage    *int `json:"nextPage"`
 		LastPage    int  `json:"lastPage"`
 	} `json:"meta"`
-	Data []struct {
-		Date struct {
-			Day string `json:"day"`
-		} `json:"date"`
-		Items []struct {
-			ID          int64  `json:"id"`
-			Date        string `json:"date"`
-			TypeName    string `json:"typeName"`
-			TypeClass   string `json:"typeClass"`
-			Title       string `json:"title"`
-			SymbolValue any    `json:"symbolValue"`
-			Subtitle    string `json:"subtitle"`
-			Note        string `json:"note"`
-			IsNew       bool   `json:"isNew"`
-			ItemURL     string `json:"itemUrl"`
-			ItemType    string `json:"itemType"`
-		} `json:"items"`
-	} `json:"data"`
+	Data json.RawMessage `json:"data"`
+}
+
+type timelineGroup struct {
+	Date struct {
+		Day string `json:"day"`
+	} `json:"date"`
+	Items json.RawMessage `json:"items"`
+}
+
+type timelineItem struct {
+	ID          int64  `json:"id"`
+	Date        string `json:"date"`
+	TypeName    string `json:"typeName"`
+	TypeClass   string `json:"typeClass"`
+	Title       string `json:"title"`
+	SymbolValue any    `json:"symbolValue"`
+	Subtitle    string `json:"subtitle"`
+	Note        string `json:"note"`
+	IsNew       bool   `json:"isNew"`
+	ItemURL     string `json:"itemUrl"`
+	ItemType    string `json:"itemType"`
 }
 
 // Timeline parses the JSON returned by /timeline-data. Text fields can contain
 // small HTML fragments, so they are normalized to plain text for stable output.
-func Timeline(body []byte, studentID string) (model.ActivityPage, error) {
+func Timeline(body []byte, studentID string, expectedPage ...int) (model.ActivityPage, error) {
 	var raw timelineResponse
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return model.ActivityPage{}, fmt.Errorf("decode timeline JSON: %w", err)
+		return model.ActivityPage{}, invalidSource("timeline response is not valid JSON")
 	}
 	if !raw.Success {
-		return model.ActivityPage{}, fmt.Errorf("timeline request was not successful")
+		return model.ActivityPage{}, invalidSource("timeline request was not successful")
+	}
+	if raw.Meta.CurrentPage < 1 || raw.Meta.LastPage < raw.Meta.CurrentPage {
+		return model.ActivityPage{}, invalidSource("timeline pagination metadata is missing or invalid")
+	}
+	if len(expectedPage) > 0 && raw.Meta.CurrentPage != expectedPage[0] {
+		return model.ActivityPage{}, invalidSource(fmt.Sprintf("timeline returned page %d for requested page %d", raw.Meta.CurrentPage, expectedPage[0]))
+	}
+	if raw.Meta.NextPage != nil && (*raw.Meta.NextPage <= raw.Meta.CurrentPage || *raw.Meta.NextPage > raw.Meta.LastPage) {
+		return model.ActivityPage{}, invalidSource("timeline next-page metadata is invalid")
+	}
+	if len(raw.Data) == 0 || bytes.Equal(bytes.TrimSpace(raw.Data), []byte("null")) {
+		return model.ActivityPage{}, invalidSource("timeline data array is missing")
+	}
+	var groups []timelineGroup
+	if err := json.Unmarshal(raw.Data, &groups); err != nil || groups == nil {
+		return model.ActivityPage{}, invalidSource("timeline data is not an array")
 	}
 	page := model.ActivityPage{SchemaVersion: model.SchemaVersion, CurrentPage: raw.Meta.CurrentPage, NextPage: raw.Meta.NextPage, LastPage: raw.Meta.LastPage, Items: []model.Activity{}}
-	for _, group := range raw.Data {
-		for _, item := range group.Items {
+	for _, group := range groups {
+		if len(group.Items) == 0 || bytes.Equal(bytes.TrimSpace(group.Items), []byte("null")) {
+			return model.ActivityPage{}, invalidSource("timeline group has no items array")
+		}
+		var items []timelineItem
+		if err := json.Unmarshal(group.Items, &items); err != nil || items == nil {
+			return model.ActivityPage{}, invalidSource("timeline group items is not an array")
+		}
+		for _, item := range items {
 			typeID := plainText(item.ItemType)
 			if typeID == "" {
 				typeID = plainText(item.TypeClass)
@@ -282,6 +385,9 @@ func Timeline(body []byte, studentID string) (model.ActivityPage, error) {
 				symbol = fmt.Sprintf("%g", value)
 			}
 			portalID := fmt.Sprintf("%d", item.ID)
+			if item.ID <= 0 || typeID == "" || plainText(item.Title) == "" {
+				return model.ActivityPage{}, invalidSource("timeline item is missing an essential identifier or type")
+			}
 			page.Items = append(page.Items, model.Activity{
 				ID: stableID(studentID, typeID, portalID), StudentID: studentID, PortalID: item.ID,
 				Date: plainText(item.Date), Day: plainText(group.Date.Day), Type: typeID,

@@ -55,13 +55,40 @@ slice will add explicit provider selection. Whole-command cancellation is
 cancelled attempt successful.
 
 The current live adapter validates grade overview, current absences, and the
-newest timeline page through the real parsers. Catch-up continuity is not yet
+newest timeline page through the real parsers. A valid empty grade overview
+still has the observed grade-table container, and a valid empty absence page
+still has the observed categories container. An arbitrary HTML page is not an
+empty section. Subject links must identify the requested enrolment. Individual
+records need their essential identifiers and fields. Unknown assessment forms,
+unknown absence statuses, and inconsistent timeline pagination are
+`invalid_source`; they are not silently omitted. Responses larger than 20 MiB
+are rejected before parsing, without returning a parsed prefix.
+
+Catch-up continuity is not yet
 implemented, so it returns `incomplete` with
 `timeline_catch_up_not_implemented` and does not commit a schema-v3 baseline.
 This is intentional: HTTP success and a parsed newest page do not establish
 continuity. Scripted adapters exercise all complete outcomes while the fetch,
 validation, and atomic-state slices are developed behind the same high-level
 check interface.
+
+Synthetic fixtures cover the selectors and JSON shapes currently observed by
+the parsers, including empty `.flex-table` and `.categories-wrap` containers.
+They do not prove that every real school, school year, or portal rollout uses
+those shapes. The private acceptance pass must compare authenticated real
+pages for: a non-empty and genuinely empty grade overview; a non-empty and
+genuinely empty absence page; numeric and any non-numeric assessment forms;
+student discovery with old and current enrolments; and timeline pagination
+metadata. Any new source variant stays unsupported until its structure and
+coverage evidence are reviewed and represented by an anonymized fixture.
+Legacy `sync --current` also refuses an empty current selection as
+`no_current_enrolments` after a structurally valid non-empty family discovery,
+and refuses discovery that loses an enrolment marked current in the previous
+snapshot. The current-year flag is inferred from the newest parsed school year
+and a non-withdrawn class label because no stronger current-enrolment marker is
+established by the available fixtures. The private acceptance pass must verify
+this inference for same-year transfers and closed enrolments before it is
+treated as real-portal compatibility evidence.
 
 `status --profile NAME` is local-only. It never contacts the portal or loads credentials. It
 reports `latest_attempt` separately from `last_success`. Until durable history
