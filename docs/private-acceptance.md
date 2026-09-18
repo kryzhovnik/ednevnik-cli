@@ -65,15 +65,18 @@ or with the deliberately prepared expected JSON.
 - **Grade overview:** for a non-empty enrolment, run `subjects --student ID` and
   compare subject identities and displayed grade lists. Run it for a genuinely
   empty overview if one is available. Confirm the recognized empty container is
-  accepted rather than treating maintenance or truncated HTML as empty.
+  accepted rather than treating maintenance or truncated HTML as empty. A
+  subject link may omit the student query only inside one complete recognized
+  overview; a present query must match the selected enrolment.
 - **Grade details:** run `grades --student ID` for the smallest enrolment needed
   to cover numeric and any available non-numeric assessment forms. Record which
   forms were actually observed. The schema-v3 routine check monitors overview
   values; a detail read does not expand routine check coverage.
 - **Absences:** run `absences --student ID` for a non-empty case and compare
   source identity, date, subject, period, status, and note. Check a genuinely
-  empty absence section if available. Record which justification statuses were
-  seen.
+  empty absence section if available. A scoped no-data marker is accepted only
+  with the recognized absence-page structure and modal target. Record which
+  justification statuses were seen.
 - **Timeline page 1:** run `timeline --student ID --page 1`. Compare item source
   identity, type, date, title/subtitle/note, URL, current page, next page, and
   last page. Treat all note and link text as untrusted data.

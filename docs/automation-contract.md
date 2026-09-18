@@ -61,14 +61,16 @@ falls back to another source. Whole-command cancellation is `cancelled`;
 retrying starts a new check and cannot make the cancelled attempt successful.
 
 The live adapter validates grade overview, current absences, and bounded
-timeline pages through the real parsers. A valid empty grade overview
-still has the observed grade-table container, and a valid empty absence page
-still has the observed categories container. The container must have an
-explicit closing tag, so a known truncated empty prefix is invalid. When the
-page supplies a student-class identifier, it must match the requested
-enrolment; an otherwise recognized empty page can have no such identifier.
-An arbitrary HTML page is not an
-empty section. Subject links must identify the requested enrolment. Individual
+timeline pages through the real parsers. A valid empty grade overview has a
+complete observed grade-table container. A valid empty absence page has either
+the complete legacy categories container or the scoped no-data structure with
+the expected absence modal target. Truncated, misplaced, or partially matching
+empty markers are invalid. When the page supplies a student-class identifier,
+it must match the requested enrolment; an otherwise recognized empty page can
+have no such identifier. An arbitrary HTML page is not an empty section.
+Subject links inside one complete recognized overview may omit the student
+query; if that query is present, it must be well-formed and identify only the
+requested enrolment. Individual
 records need their essential identifiers and fields. Unknown assessment forms,
 unknown absence statuses, and inconsistent timeline pagination are
 `invalid_source`; they are not silently omitted. Responses larger than 20 MiB
@@ -82,7 +84,9 @@ leaves the prior successful baseline unchanged. This proves continuity only
 through the inspected bounded feed; it is not all-history coverage.
 
 Synthetic fixtures cover the selectors and JSON shapes currently observed by
-the parsers, including empty `.flex-table` and `.categories-wrap` containers.
+the parsers, including complete empty `.flex-table` and `.categories-wrap`
+containers, the scoped absence no-data structure, and overview links with and
+without a valid student query.
 They do not prove that every real school, school year, or portal rollout uses
 those shapes. The private acceptance pass must compare authenticated real
 pages for: a non-empty and genuinely empty grade overview; a non-empty and
