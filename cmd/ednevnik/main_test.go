@@ -1254,6 +1254,142 @@ func TestConsumerReplayAcrossCLIProcesses(t *testing.T) {
 	}
 }
 
+func TestConsumerReplayRacesActualCLIChecksWithoutPortalReads(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	var stage atomic.Int32
+	var requests atomic.Int32
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests.Add(1)
+		switch req.URL.Path {
+		case "/grades":
+			_, _ = w.Write([]byte(`<a class="flex-table-row" href="/grades/7654321/show?student=1234567"><div><strong class="d-block">Mathematics</strong></div></a>`))
+		case "/absents":
+			_, _ = w.Write([]byte(`<div class="categories-wrap"></div>`))
+		case "/timeline-data":
+			items := []string{timelineItem(100, "baseline")}
+			for id := 101; id <= 100+int(stage.Load()); id++ {
+				items = append([]string{timelineItem(id, fmt.Sprintf("event-%d", id))}, items...)
+			}
+			_, _ = w.Write([]byte(timelinePage(1, 1, items...)))
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer portal.Close()
+	root := t.TempDir()
+	env := append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+root, "EDNEVNIK_STATE_DIR="+root, "EDNEVNIK_BASE_URL="+portal.URL)
+	command := func(args ...string) ([]byte, error) {
+		c := exec.Command(binary, args...)
+		c.Env = env
+		return c.Output()
+	}
+	mustCommand := func(args ...string) []byte {
+		t.Helper()
+		out, err := command(args...)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		return out
+	}
+	decode := func(data []byte) checkstate.Batch {
+		t.Helper()
+		var b checkstate.Batch
+		if err := json.Unmarshal(data, &b); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	mustCommand("check", "--profile=family", "--student=1234567")
+	portalBeforeLocal := requests.Load()
+	mustCommand("consumer-register", "--profile=family", "--consumer=notify", "--start=earliest")
+	mustCommand("consumer-register", "--profile=family", "--consumer=audit", "--start=earliest")
+	if requests.Load() != portalBeforeLocal {
+		t.Fatal("consumer registration contacted portal")
+	}
+	stage.Store(1)
+	mustCommand("check", "--force", "--profile=family", "--student=1234567")
+	first := decode(mustCommand("consumer-read", "--profile=family", "--consumer=notify", "--limit=1"))
+	auditFirst := decode(mustCommand("consumer-read", "--profile=family", "--consumer=audit", "--limit=1"))
+	if len(first.Events) != 1 || len(auditFirst.Events) != 1 {
+		t.Fatalf("first=%#v audit=%#v", first, auditFirst)
+	}
+	localCount := requests.Load()
+	for _, args := range [][]string{
+		{"consumer-ack", "--profile=family", "--consumer=audit", "--token=" + first.Token},
+		{"consumer-ack", "--profile=family", "--consumer=notify", "--token=malformed"},
+	} {
+		if _, err := command(args...); err == nil {
+			t.Fatalf("invalid acknowledgement accepted: %v", args)
+		}
+	}
+	if requests.Load() != localCount {
+		t.Fatal("invalid local acknowledgement contacted portal")
+	}
+	if again := decode(mustCommand("consumer-read", "--profile=family", "--consumer=notify")); again.Token != first.Token {
+		t.Fatal("invalid acknowledgement moved cursor")
+	}
+	stage.Store(2)
+	checkDone, readDone := make(chan error, 1), make(chan struct {
+		b   checkstate.Batch
+		err error
+	}, 1)
+	go func() {
+		_, err := command("check", "--force", "--profile=family", "--student=1234567")
+		checkDone <- err
+	}()
+	go func() {
+		out, err := command("consumer-read", "--profile=family", "--consumer=notify")
+		if err != nil {
+			readDone <- struct {
+				b   checkstate.Batch
+				err error
+			}{err: err}
+			return
+		}
+		readDone <- struct {
+			b   checkstate.Batch
+			err error
+		}{b: decode(out)}
+	}()
+	if err := <-checkDone; err != nil {
+		t.Fatal(err)
+	}
+	replay := <-readDone
+	if replay.err != nil || replay.b.Token != first.Token || replay.b.Events[0].ID != first.Events[0].ID {
+		t.Fatalf("racing replay=%#v err=%v", replay.b, replay.err)
+	}
+	stage.Store(3)
+	checkDone = make(chan error, 1)
+	ackDone := make(chan error, 1)
+	go func() {
+		_, err := command("check", "--force", "--profile=family", "--student=1234567")
+		checkDone <- err
+	}()
+	go func() {
+		_, err := command("consumer-ack", "--profile=family", "--consumer=notify", "--token="+first.Token)
+		ackDone <- err
+	}()
+	if err := <-checkDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-ackDone; err != nil {
+		t.Fatal(err)
+	}
+	localCount = requests.Load()
+	mustCommand("consumer-ack", "--profile=family", "--consumer=notify", "--token="+first.Token)
+	remaining := decode(mustCommand("consumer-read", "--profile=family", "--consumer=notify", "--limit=100"))
+	auditReplay := decode(mustCommand("consumer-read", "--profile=family", "--consumer=audit", "--limit=100"))
+	if requests.Load() != localCount {
+		t.Fatal("consumer read or acknowledgement contacted portal")
+	}
+	if len(remaining.Events) != 2 || len(auditReplay.Events) != 1 || auditReplay.Token != auditFirst.Token {
+		t.Fatalf("remaining=%#v audit=%#v", remaining, auditReplay)
+	}
+}
+
 func successfulResult(profile checkProfile, id, outcome, enrolment string) model.CheckResult {
 	return model.CheckResult{SchemaVersion: checkSchemaVersion, CheckID: id, Outcome: outcome, Profile: profile, Requested: []string{enrolment}, Coverage: []model.EnrolmentCoverage{{EnrolmentID: enrolment, Sections: []model.SectionCoverage{}, Continuity: model.ContinuityCoverage{State: "complete"}}}, StartedAt: time.Now(), CompletedAt: time.Now(), Baseline: model.BaselineReference{ID: "baseline_" + id, NewEnrolments: []string{}}, Changes: model.ChangeSummary{Items: []model.Change{}}, Guidance: model.Guidance{}}
 }
