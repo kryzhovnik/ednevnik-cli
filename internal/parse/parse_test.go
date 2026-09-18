@@ -123,6 +123,41 @@ func TestSubjectsRequireRequestedEnrolmentEvidence(t *testing.T) {
 	}
 }
 
+func TestSubjectsAcceptRecognizedLinkWithoutStudentQuery(t *testing.T) {
+	body := []byte(`<div class="flex-table"><a class="flex-table-row" href="/grades/7654321/show"><strong class="d-block">Math</strong></a></div>`)
+	subjects, err := Subjects(body, "1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subjects) != 1 || subjects[0].ID != "7654321" || subjects[0].Name != "Math" {
+		t.Fatalf("subjects = %#v", subjects)
+	}
+}
+
+func TestSubjectsRejectInvalidStudentQueryWhenPresent(t *testing.T) {
+	for _, href := range []string{
+		`/grades/7654321/show?student=`,
+		`/grades/7654321/show?student=1234567&student=9999999`,
+		`/grades/7654321/show?student=%zz`,
+	} {
+		body := []byte(`<div class="flex-table"><a href="` + href + `"><strong class="d-block">Math</strong></a></div>`)
+		if _, err := Subjects(body, "1234567"); !errors.Is(err, ErrInvalidSource) {
+			t.Errorf("href %q: error = %v", href, err)
+		}
+	}
+}
+
+func TestSubjectsRejectOmittedStudentQueryInIncompleteOverview(t *testing.T) {
+	for _, body := range []string{
+		`<div class="flex-table"></div><div class="flex-table"><a href="/grades/7654321/show"><strong class="d-block">Math</strong></a>`,
+		`<div class="flex-table"/><a href="/grades/7654321/show"><strong class="d-block">Math</strong></a>`,
+	} {
+		if _, err := Subjects([]byte(body), "1234567"); !errors.Is(err, ErrInvalidSource) {
+			t.Errorf("body %q: error = %v", body, err)
+		}
+	}
+}
+
 func TestEmptySectionsRejectWrongEnrolmentAndTruncatedContainer(t *testing.T) {
 	wrong := []byte(`<div class="flex-table" data-student-class-id="9999999"></div>`)
 	if _, err := Subjects(wrong, "1234567"); err == nil {
@@ -174,6 +209,45 @@ func TestAbsences(t *testing.T) {
 	}
 	if items[1].Status != "excused" {
 		t.Fatalf("second = %#v", items[1])
+	}
+}
+
+func TestAbsencesAcceptScopedNoDataMarker(t *testing.T) {
+	body := []byte(`<html><body><div><div class="main-content container"><div class="ee-container"><div class="stats-wrap mb-3"></div><no-data></no-data><absent-modal name="absence" submit-url="/absences"></absent-modal></div></div></div></body></html>`)
+	items, err := Absences(body, "1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %#v", items)
+	}
+}
+
+func TestAbsencesRejectInvalidNoDataMarker(t *testing.T) {
+	for _, body := range []string{
+		`<no-data></no-data>`,
+		`<no-data>`,
+		`<no-data data-student-class-id="1234567"></no-data>`,
+		`<no-data>unexpected</no-data>`,
+		`<no-data></no-data><div>unexpected</div>`,
+		`<div><no-data></no-data></div>`,
+		`<no-data></no-data><div class="categories-wrap"></div>`,
+		`<html><body><div><div class="main-content container"><div class="ee-container"><no-data></no-data></div></div></div></body></html>`,
+		`<html><body><div><div class="main-content container"><div class="ee-container"><no-data></no-data></body></html>`,
+		`<html><body><div><div class="main-content container"><div class="ee-container"/><no-data></no-data></div></div></body></html>`,
+		`<html><body><div><div class="main-content container"><div class="ee-container"><div class="stats-wrap mb-3"></div><no-data></no-data><div>unexpected</div></div></div></div></body></html>`,
+		`<html><body><div><div class="main-content container"><div class="ee-container"><div class="stats-wrap mb-3"></div><no-data></no-data><absent-modal name="absence"></absent-modal></div></div></div></body></html>`,
+	} {
+		if _, err := Absences([]byte(body), "1234567"); !errors.Is(err, ErrInvalidSource) {
+			t.Errorf("body %q: error = %v", body, err)
+		}
+	}
+}
+
+func TestAbsencesNoDataMarkerStillRejectsWrongEnrolment(t *testing.T) {
+	body := []byte(`<html><body><div><div class="main-content container" data-student-class-id="9999999"><div class="ee-container"><div class="stats-wrap mb-3"></div><no-data></no-data><absent-modal name="absence" submit-url="/absences"></absent-modal></div></div></div></body></html>`)
+	if _, err := Absences(body, "1234567"); !errors.Is(err, ErrInvalidSource) {
+		t.Fatalf("error = %v", err)
 	}
 }
 

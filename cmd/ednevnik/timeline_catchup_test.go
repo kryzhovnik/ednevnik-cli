@@ -33,6 +33,22 @@ type shiftingHeadClient struct {
 	headReads int
 }
 
+type liveVariantClient struct {
+	*timelineScriptClient
+}
+
+func (c *liveVariantClient) Get(ctx context.Context, path string) ([]byte, error) {
+	u, _ := url.Parse(path)
+	switch u.Path {
+	case "/grades":
+		return []byte(`<div class="flex-table"><a class="flex-table-row" href="/grades/7654321/show"><strong class="d-block">Mathematics</strong></a></div>`), nil
+	case "/absents":
+		return []byte(`<html><body><div><div class="main-content container"><div class="ee-container"><div class="stats-wrap mb-3"></div><no-data></no-data><absent-modal name="absence" submit-url="/absences"></absent-modal></div></div></div></body></html>`), nil
+	default:
+		return c.timelineScriptClient.Get(ctx, path)
+	}
+}
+
 func (c *shiftingHeadClient) Get(ctx context.Context, path string) ([]byte, error) {
 	u, _ := url.Parse(path)
 	if u.Path == "/timeline-data" && u.Query().Get("page") == "1" {
@@ -111,6 +127,22 @@ func runCheckResult(t *testing.T, a *app) (checkResult, error) {
 		t.Fatalf("decode check result %q: %v", data, unmarshalErr)
 	}
 	return result, err
+}
+
+func TestLiveCheckAcceptsVerifiedOverviewAndEmptyAbsenceVariants(t *testing.T) {
+	client := &liveVariantClient{timelineScriptClient: &timelineScriptClient{pages: map[int]string{1: timelinePage(1, 1)}}}
+	runner := liveCheckRunner{app: &app{client: client}}
+	run, err := runner.Check(context.Background(), checkRequest{CheckID: "check_test", ProfileID: "family", Enrolments: []string{"1234567"}, Prior: map[string]checkstate.Baseline{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Result.Outcome != model.OutcomeInitialBaseline || len(run.Observations) != 1 {
+		t.Fatalf("run = %#v", run)
+	}
+	sections := run.Result.Coverage[0].Sections
+	if len(sections) != 3 || sections[0].State != "complete" || sections[1].State != "complete" {
+		t.Fatalf("sections = %#v", sections)
+	}
 }
 
 func TestTimelineCatchUpCommitsAllPagesThroughOverlap(t *testing.T) {

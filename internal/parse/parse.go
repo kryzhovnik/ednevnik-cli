@@ -188,8 +188,8 @@ func Subjects(body []byte, expectedEnrolment ...string) ([]model.Subject, error)
 			return
 		}
 		if len(expectedEnrolment) > 0 && expectedEnrolment[0] != "" {
-			u, err := url.Parse(href)
-			if err != nil || u.Query().Get("student") != expectedEnrolment[0] {
+			queryOmitted, err := validateSubjectLinkEnrolment(href, expectedEnrolment[0])
+			if err != nil || queryOmitted && !subjectLinkHasCompleteOverview(body, s) {
 				invalid = "subject link does not identify the requested enrolment"
 				return
 			}
@@ -297,11 +297,19 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 	if err != nil {
 		return nil, err
 	}
-	if doc.Find(`.categories-wrap`).Length() == 0 {
-		return nil, invalidSource("absence structure was not recognized")
-	}
 	if err := validateSuppliedEnrolment(doc, studentID, "absence page"); err != nil {
 		return nil, err
+	}
+	hasCategories := doc.Find(`.categories-wrap`).Length() > 0
+	hasNoData := hasCompleteAbsenceNoData(body, doc)
+	if doc.Find("no-data").Length() > 0 && !hasNoData {
+		return nil, invalidSource("absence empty marker is incomplete or conflicts with records")
+	}
+	if !hasCategories && !hasNoData {
+		return nil, invalidSource("absence structure was not recognized")
+	}
+	if hasNoData {
+		return []model.Absence{}, nil
 	}
 	var out []model.Absence
 	fallbackOrdinals := map[string]int{}
@@ -349,6 +357,69 @@ func Absences(body []byte, studentID string) ([]model.Absence, error) {
 		return nil, invalidSource("absence source identifier is duplicated")
 	}
 	return out, nil
+}
+
+func validateSubjectLinkEnrolment(href, expected string) (bool, error) {
+	u, err := url.Parse(href)
+	if err != nil {
+		return false, err
+	}
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return false, err
+	}
+	values, supplied := query["student"]
+	if !supplied {
+		return true, nil
+	}
+	if len(values) != 1 || values[0] == "" || values[0] != expected {
+		return false, errors.New("student query is empty, conflicting, or mismatched")
+	}
+	return false, nil
+}
+
+func subjectLinkHasCompleteOverview(body []byte, link *goquery.Selection) bool {
+	container := link.Closest(".flex-table, .grades-wrap")
+	if container.Length() == 0 {
+		return false
+	}
+	if container.HasClass("flex-table") {
+		return allClassElementsClosed(body, "flex-table", container.Get(0).Data)
+	}
+	return allClassElementsClosed(body, "grades-wrap", container.Get(0).Data)
+}
+
+func hasCompleteAbsenceNoData(body []byte, doc *goquery.Document) bool {
+	markers := doc.Find("no-data")
+	if markers.Length() != 1 || doc.Find(".categories-wrap, .category-item-wrap").Length() != 0 {
+		return false
+	}
+	marker := markers.First()
+	if len(marker.Get(0).Attr) != 0 || marker.Contents().Length() != 0 || !hasClosedTag(body, "no-data") {
+		return false
+	}
+	if !marker.Is("body > div > div.main-content.container > div.ee-container > no-data") {
+		return false
+	}
+	return hasVerifiedNoDataSiblings(marker) &&
+		allClassElementsClosed(body, "ee-container", "div") &&
+		allClassElementsClosed(body, "main-content", "div") &&
+		allClassElementsClosed(body, "stats-wrap", "div") &&
+		hasClosedTag(body, "absent-modal")
+}
+
+func hasVerifiedNoDataSiblings(marker *goquery.Selection) bool {
+	children := marker.Parent().Children()
+	if children.Length() != 3 || !children.Eq(0).Is("div.stats-wrap.mb-3") || !children.Eq(1).Is("no-data") || !children.Eq(2).Is("absent-modal") {
+		return false
+	}
+	modal := children.Eq(2)
+	if modal.Contents().Length() != 0 || len(modal.Get(0).Attr) != 2 {
+		return false
+	}
+	_, hasName := modal.Attr("name")
+	_, hasSubmitURL := modal.Attr("submit-url")
+	return hasName && hasSubmitURL
 }
 
 func duplicateGradeSourceID(items []model.Grade) string {
@@ -432,6 +503,73 @@ func hasClosedClassElement(body []byte, className string) bool {
 			if targetTag != "" && token.Data == targetTag {
 				nestedTargets--
 				if nestedTargets == 0 {
+					return true
+				}
+			}
+		}
+	}
+}
+
+func allClassElementsClosed(body []byte, className, tagName string) bool {
+	tokenizer := xhtml.NewTokenizer(bytes.NewReader(body))
+	stack := []bool{}
+	targets := 0
+	closed := 0
+	for {
+		switch tokenizer.Next() {
+		case xhtml.ErrorToken:
+			return targets > 0 && targets == closed
+		case xhtml.StartTagToken:
+			token := tokenizer.Token()
+			if token.Data != tagName {
+				continue
+			}
+			target := false
+			for _, attr := range token.Attr {
+				if attr.Key == "class" && slices.Contains(strings.Fields(attr.Val), className) {
+					target = true
+					targets++
+					break
+				}
+			}
+			stack = append(stack, target)
+		case xhtml.SelfClosingTagToken:
+			token := tokenizer.Token()
+			if token.Data != tagName {
+				continue
+			}
+			for _, attr := range token.Attr {
+				if attr.Key == "class" && slices.Contains(strings.Fields(attr.Val), className) {
+					return false
+				}
+			}
+		case xhtml.EndTagToken:
+			if tokenizer.Token().Data != tagName || len(stack) == 0 {
+				continue
+			}
+			if stack[len(stack)-1] {
+				closed++
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+}
+
+func hasClosedTag(body []byte, tagName string) bool {
+	tokenizer := xhtml.NewTokenizer(bytes.NewReader(body))
+	depth := 0
+	for {
+		switch tokenizer.Next() {
+		case xhtml.ErrorToken:
+			return false
+		case xhtml.StartTagToken:
+			if tokenizer.Token().Data == tagName {
+				depth++
+			}
+		case xhtml.EndTagToken:
+			if tokenizer.Token().Data == tagName && depth > 0 {
+				depth--
+				if depth == 0 {
 					return true
 				}
 			}
