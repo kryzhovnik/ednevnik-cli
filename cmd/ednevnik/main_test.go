@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kryzhovnik/ednevnik/internal/client"
+	"github.com/kryzhovnik/ednevnik/internal/coordination"
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
@@ -314,8 +317,8 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
-	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	cmd := exec.Command(binary, "check", "--profile=family", "--student", "1234567")
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
@@ -329,7 +332,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 	portalMode.Store("empty-grades")
 	cmd = exec.Command(binary, "grades", "--student", "1234567")
-	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 	stdout.Reset()
 	stderr.Reset()
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -342,6 +345,10 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 	portalMode.Store("valid")
 
+	coord, coordErr := coordination.New(stateDir, coordination.Namespace{Profile: "family", Origin: canonicalOrigin(portal.URL)}, coordination.DefaultConfig())
+	if coordErr != nil {
+		t.Fatal(coordErr)
+	}
 	// Seed an earlier complete result and prove that source failures update only
 	// the latest attempt. The successful baseline remains available to status.
 	success := incomplete
@@ -350,14 +357,14 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	success.Coverage[0].Continuity = continuityCoverage{State: "complete"}
 	success.Baseline = baselineReference{ID: "baseline-known-good", NewEnrolments: []string{}}
 	status := checkStatus{SchemaVersion: checkSchemaVersion, History: "latest_attempt_only", LatestAttempt: &success, LastSuccess: &success}
-	statusPath := filepath.Join(stateDir, "profiles", "family", "check-status.json")
+	statusPath := filepath.Join(coord.StateDir(), "check-status.json")
 	if err := store.SaveSnapshot(statusPath, status); err != nil {
 		t.Fatal(err)
 	}
 	for _, mode := range []string{"maintenance", "success-only", "oversized"} {
 		portalMode.Store(mode)
-		cmd = exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
-		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+		cmd = exec.Command(binary, "check", "--force", "--profile", "family", "--student", "1234567")
+		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 		stdout.Reset()
 		stderr.Reset()
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -376,7 +383,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 	portalMode.Store("maintenance")
 	cmd = exec.Command(binary, "subjects", "--student", "1234567")
-	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 	stdout.Reset()
 	stderr.Reset()
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -421,6 +428,128 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	}
 }
 
+func TestConcurrentCLIProcessesShareAccountRequestPolicy(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	var active, maximum, requests atomic.Int32
+	var mode atomic.Value
+	mode.Store("normal")
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	var timesMu sync.Mutex
+	var requestTimes []time.Time
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		current := active.Add(1)
+		defer active.Add(-1)
+		for old := maximum.Load(); current > old && !maximum.CompareAndSwap(old, current); old = maximum.Load() {
+		}
+		timesMu.Lock()
+		requestTimes = append(requestTimes, time.Now())
+		timesMu.Unlock()
+		if mode.Load() == "hold" {
+			entered <- struct{}{}
+			<-release
+		}
+		if mode.Load() == "refuse" {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "later", http.StatusTooManyRequests)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		_, _ = io.WriteString(w, "<html><title>Synthetic</title><body>ok</body></html>")
+	}))
+	defer portal.Close()
+	stateDir := t.TempDir()
+	newCommand := func(profile string) *exec.Cmd {
+		cmd := exec.Command(binary, "page", "--path", "/synthetic")
+		cmd.Env = append(os.Environ(), "EDNEVNIK_PROFILE="+profile, "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL, "EDNEVNIK_REQUEST_INTERVAL=100ms")
+		return cmd
+	}
+	first, second := newCommand("family"), newCommand("family")
+	if err := first.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if maximum.Load() != 1 {
+		t.Fatalf("maximum concurrent requests=%d", maximum.Load())
+	}
+	timesMu.Lock()
+	if len(requestTimes) != 2 || requestTimes[1].Sub(requestTimes[0]) < 90*time.Millisecond {
+		timesMu.Unlock()
+		t.Fatalf("request times=%v", requestTimes)
+	}
+	timesMu.Unlock()
+	coord, err := coordination.New(stateDir, coordination.Namespace{Profile: "family", Origin: canonicalOrigin(portal.URL)}, coordination.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policy struct {
+		Count int `json:"count"`
+	}
+	if err := store.LoadSnapshot(filepath.Join(coord.StateDir(), "request-policy.json"), &policy); err != nil || policy.Count != 2 {
+		t.Fatalf("policy=%+v err=%v", policy, err)
+	}
+
+	mode.Store("hold")
+	holder := newCommand("family")
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	waiter := newCommand("family")
+	waiter.Env = append(waiter.Env, "EDNEVNIK_COORDINATION_WAIT=50ms")
+	waiterOutput, waiterErr := waiter.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(waiterErr, &exitErr) || !strings.Contains(string(waiterOutput), `"reason":"concurrency"`) {
+		t.Fatalf("waiter err=%v output=%q", waiterErr, waiterOutput)
+	}
+	close(release)
+	if err := holder.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	mode.Store("refuse")
+	refused := newCommand("family")
+	refusedOutput, refusedErr := refused.CombinedOutput()
+	if !errors.As(refusedErr, &exitErr) || !strings.Contains(string(refusedOutput), `"reason":"refusal_quota"`) {
+		t.Fatalf("server refusal err=%v output=%q", refusedErr, refusedOutput)
+	}
+	requestsAfterRefusal := requests.Load()
+	mode.Store("normal")
+	later := newCommand("family")
+	laterOutput, laterErr := later.CombinedOutput()
+	if !errors.As(laterErr, &exitErr) || !strings.Contains(string(laterOutput), `"reason":"refusal_quota"`) || requests.Load() != requestsAfterRefusal {
+		t.Fatalf("later err=%v output=%q requests=%d want=%d", laterErr, laterOutput, requests.Load(), requestsAfterRefusal)
+	}
+
+	for _, profile := range []string{"other_a", "other_b"} {
+		cmd := newCommand(profile)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("profile %s: %v %q", profile, err, output)
+		}
+		other, err := coordination.New(stateDir, coordination.Namespace{Profile: profile, Origin: canonicalOrigin(portal.URL)}, coordination.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var isolated struct {
+			Count int `json:"count"`
+		}
+		if err := store.LoadSnapshot(filepath.Join(other.StateDir(), "request-policy.json"), &isolated); err != nil || isolated.Count != 1 {
+			t.Fatalf("profile=%s policy=%+v err=%v", profile, isolated, err)
+		}
+	}
+}
+
 type retryClient struct {
 	gets   int
 	logins int
@@ -453,6 +582,63 @@ func TestGetAutomaticallyLogsInAndRetries(t *testing.T) {
 	}
 	if string(body) != "ok" || fake.gets != 2 || fake.logins != 1 {
 		t.Fatalf("body=%q gets=%d logins=%d", body, fake.gets, fake.logins)
+	}
+}
+
+func TestCommandProfileMatchesFlagPackageForms(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"check", "--profile", "family", "--student", "1"}, "family"},
+		{[]string{"check", "--profile=family", "--student", "1"}, "family"},
+		{[]string{"check", "--profile=old", "--profile", "family", "--student", "1"}, "family"},
+	} {
+		if got := commandProfile(tc.args); got != tc.want {
+			t.Fatalf("commandProfile(%q)=%q want %q", tc.args, got, tc.want)
+		}
+	}
+	t.Setenv("EDNEVNIK_PROFILE", "family")
+	if a, b := commandProfile([]string{"sync", "--consumer", "one"}), commandProfile([]string{"sync", "--consumer", "two"}); a != b || a != "family" {
+		t.Fatalf("consumer changed account namespace: %q %q", a, b)
+	}
+}
+
+func TestHelpAndVersionIgnoreInvalidPolicyEnvironment(t *testing.T) {
+	t.Setenv("EDNEVNIK_COMMAND_TIMEOUT", "invalid")
+	t.Setenv("EDNEVNIK_DAILY_REQUEST_LIMIT", "invalid")
+	if err := run(context.Background(), []string{"help"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"version"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNamespacedLegacyStateRefusesUnboundFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "latest.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{dir: root, legacyDir: filepath.Join(root, "coordination", "family", "schema-v2")}
+	if _, err := a.consumerDir(""); !errors.Is(err, errUnboundLegacyState) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestCheckRefusesFutureAttemptTimestamp(t *testing.T) {
+	dir := t.TempDir()
+	profile := checkProfile{ID: "family", Origin: "https://portal.example"}
+	future := time.Now().UTC().Add(time.Hour)
+	prior := checkStatus{SchemaVersion: checkSchemaVersion, History: "latest_attempt_only", LatestAttempt: &checkResult{SchemaVersion: checkSchemaVersion, CheckID: "future", Outcome: model.OutcomeFailed, Profile: profile, Requested: []string{"1234567"}, Coverage: []enrolmentCoverage{}, StartedAt: future, CompletedAt: future, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: guidance{}, Failure: &model.FailureSummary{Reason: model.ReasonIO}}}
+	if err := store.SaveSnapshot(filepath.Join(dir, "profiles", "family", "check-status.json"), prior); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{dir: dir, origin: profile.Origin, checker: scriptedCheckRunner{}}
+	err := a.check(context.Background(), []string{"--profile=family", "--student", "1234567"})
+	var ce *commandError
+	if !errors.As(err, &ce) || ce.body.Reason != model.ReasonRefusalQuota {
+		t.Fatalf("error=%#v", err)
 	}
 }
 

@@ -17,6 +17,10 @@ child-school-class-school-year association), not a permanent child. Repeated
 selections are deduplicated. Selecting a subset means “observe only these
 enrolments”; it never implies removal of unselected data.
 
+All commands for that namespace share the process lock and request policy
+described in [Shared request and command coordination](request-policy.md).
+Consumer names do not create independent request budgets or sessions.
+
 ## Results and exit status
 
 A result contains `schema_version`, `check_id`, `profile`,

@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,24 +20,29 @@ import (
 	"time"
 
 	"github.com/kryzhovnik/ednevnik/internal/client"
+	"github.com/kryzhovnik/ednevnik/internal/coordination"
 	"github.com/kryzhovnik/ednevnik/internal/credentials"
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
-	"github.com/kryzhovnik/ednevnik/internal/throttle"
 	"golang.org/x/term"
 )
 
 const version = "0.1.0-dev"
 
 type app struct {
-	client    siteClient
-	dir       string
-	creds     credentialStore
-	checker   checkRunner
-	origin    string
-	configDir string
+	client     siteClient
+	dir        string
+	creds      credentialStore
+	checker    checkRunner
+	origin     string
+	configDir  string
+	lease      *coordination.Lease
+	legacyDir  string
+	accountDir string
 }
+
+var errUnboundLegacyState = errors.New("unbound schema-v2 state requires explicit migration")
 
 type credentialStore interface {
 	PromptSave(string) error
@@ -49,7 +56,9 @@ type siteClient interface {
 }
 
 func main() {
-	if err := run(context.Background(), os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:]); err != nil {
 		var silent *exitStatus
 		if errors.As(err, &silent) {
 			os.Exit(silent.code)
@@ -59,10 +68,19 @@ func main() {
 			_ = json.NewEncoder(os.Stderr).Encode(structured.body)
 			os.Exit(structured.code)
 		}
+		if operational := classifyOperationalError(err); operational != nil {
+			_ = json.NewEncoder(os.Stderr).Encode(operational.body)
+			os.Exit(operational.code)
+		}
 		if errors.Is(err, parse.ErrInvalidSource) || errors.Is(err, client.ErrResponseTooLarge) {
 			failure := newContractError("", model.ReasonInvalidSource, errors.New("portal response did not match the recognized source structure"), false, "Keep the last valid snapshot and inspect portal compatibility before retrying.", 1)
 			_ = json.NewEncoder(os.Stderr).Encode(failure.body)
 			os.Exit(failure.code)
+		}
+		if errors.Is(err, errUnboundLegacyState) {
+			structured := newContractError("", model.ReasonInvalidState, err, false, "Preserve the files and migrate them explicitly into the selected profile and origin.", 1)
+			_ = json.NewEncoder(os.Stderr).Encode(structured.body)
+			os.Exit(structured.code)
 		}
 		fallback := newContractError("", "io", err, true, "Retry after checking local configuration and I/O.", 1)
 		_ = json.NewEncoder(os.Stderr).Encode(fallback.body)
@@ -70,12 +88,42 @@ func main() {
 	}
 }
 
+func classifyOperationalError(err error) *commandError {
+	var refusal *coordination.Refusal
+	if errors.As(err, &refusal) {
+		result := newContractError("", model.ReasonRefusalQuota, err, true, "Wait until the reported retry time; force does not bypass request budgets or server cooldowns.", 1)
+		result.body.Guidance.RetryAfter = &refusal.RetryAt
+		return result
+	}
+	if errors.Is(err, coordination.ErrInvalidState) {
+		return newContractError("", model.ReasonInvalidState, err, false, "Preserve the policy file and repair or migrate it explicitly.", 1)
+	}
+	if errors.Is(err, coordination.ErrLockTimeout) {
+		return newContractError("", model.ReasonConcurrency, err, true, "Retry after the other account command finishes.", 1)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return newContractError("", model.ReasonCancelled, err, true, "Retry as a new command after the cancellation or deadline condition is resolved.", 1)
+	}
+	var httpErr *client.HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode == http.StatusServiceUnavailable {
+			retryAt := time.Now().UTC().Add(httpErr.RetryAfter)
+			result := newContractError("", model.ReasonRefusalQuota, err, true, "Respect the persisted server cooldown before retrying.", 1)
+			result.body.Guidance.RetryAfter = &retryAt
+			return result
+		}
+		if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden {
+			return newContractError("", model.ReasonAuthenticationProvider, err, false, "Authenticate the selected account once; do not retry rejected credentials automatically.", 1)
+		}
+	}
+	return nil
+}
+
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return newContractError("", "invalid_argument", flag.ErrHelp, false, "Choose a command shown in help.", 2)
 	}
-	// These commands are local and must remain available even when session or
-	// portal configuration is invalid.
+	// Help/version never touch account state.
 	switch args[0] {
 	case "version":
 		fmt.Println(version)
@@ -83,18 +131,18 @@ func run(ctx context.Context, args []string) error {
 	case "help", "-h", "--help":
 		usage()
 		return nil
-	case "status", "changes":
-		configDir, err := os.UserConfigDir()
-		if err != nil {
-			return err
-		}
-		appDir := filepath.Join(configDir, "ednevnik")
-		local := &app{dir: envOr("EDNEVNIK_STATE_DIR", appDir), configDir: appDir, origin: canonicalOrigin(envOr("EDNEVNIK_BASE_URL", client.DefaultBaseURL))}
-		if args[0] == "status" {
-			return local.status(args[1:])
-		}
-		return local.changes(args[1:])
 	}
+	deadline := 5 * time.Minute
+	if raw := os.Getenv("EDNEVNIK_COMMAND_TIMEOUT"); raw != "" {
+		parsed, parseErr := time.ParseDuration(raw)
+		if parseErr != nil || parsed <= 0 {
+			return newContractError("", model.ReasonInvalidArgument, errors.New("EDNEVNIK_COMMAND_TIMEOUT must be a positive duration"), false, "Correct the whole-command timeout.", 2)
+		}
+		deadline = parsed
+	}
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, deadline)
+	defer cancel()
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return err
@@ -112,13 +160,48 @@ func run(ctx context.Context, args []string) error {
 	baseURL := envOr("EDNEVNIK_BASE_URL", client.DefaultBaseURL)
 	origin, err := validateConfiguredOrigin(baseURL, testLoopback)
 	if err != nil {
-		return newContractError("", model.ReasonInvalidArgument, errors.New("EDNEVNIK_BASE_URL must be a canonical HTTPS origin without credentials, path, query, or fragment"), false, "Set EDNEVNIK_BASE_URL to the authorized portal HTTPS origin.", 2)
+		if (args[0] == "status" && !hasProfileFlag(args)) || args[0] == "changes" {
+			origin = "local-v2://unbound"
+		} else if args[0] == "status" && hasProfileFlag(args) && isLoopbackOrigin(baseURL) {
+			// Local recovery may inspect an explicitly named synthetic profile
+			// without enabling test transport or making a request.
+			origin = canonicalOrigin(baseURL)
+		} else {
+			return newContractError("", model.ReasonInvalidArgument, errors.New("EDNEVNIK_BASE_URL must be a canonical HTTPS origin without credentials, path, query, or fragment"), false, "Set EDNEVNIK_BASE_URL to the authorized portal HTTPS origin.", 2)
+		}
 	}
-	c, err := client.New(baseURL, filepath.Join(dir, "session.json"), 2500*time.Millisecond)
+	profile := commandProfile(args)
+	if origin == "local-v2://unbound" {
+		profile = "legacy"
+	}
+	if err := validateNamespace(profile, "profile"); err != nil {
+		return newContractError("", model.ReasonInvalidArgument, err, false, "Use lowercase letters, digits, and underscores for the profile namespace.", 2)
+	}
+	policyConfig, err := coordination.ConfigFromEnv()
+	if err != nil {
+		return newContractError("", model.ReasonInvalidArgument, err, false, "Correct the request-policy configuration.", 2)
+	}
+	coordinator, err := coordination.New(stateDir, coordination.Namespace{Profile: profile, Origin: origin}, policyConfig)
 	if err != nil {
 		return err
 	}
-	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}, origin: origin, configDir: dir}
+	lease, err := coordinator.Acquire(ctx)
+	if err != nil {
+		return classifyCoordinationError(err)
+	}
+	defer lease.Release()
+	if args[0] == "status" || args[0] == "changes" {
+		local := &app{dir: stateDir, configDir: dir, origin: origin, lease: lease, legacyDir: filepath.Join(coordinator.StateDir(), "schema-v2"), accountDir: coordinator.StateDir()}
+		if args[0] == "status" {
+			return local.status(args[1:])
+		}
+		return local.changes(args[1:])
+	}
+	c, err := client.New(baseURL, filepath.Join(coordinator.StateDir(), "session.json"), lease)
+	if err != nil {
+		return err
+	}
+	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}, origin: origin, configDir: dir, lease: lease, legacyDir: filepath.Join(coordinator.StateDir(), "schema-v2"), accountDir: coordinator.StateDir()}
 	if testLoopback {
 		a.creds = nil
 	}
@@ -148,6 +231,15 @@ func run(ctx context.Context, args []string) error {
 	default:
 		return newContractError("", "invalid_argument", fmt.Errorf("unknown command %q", args[0]), false, "Choose a command shown in help.", 2)
 	}
+}
+
+func isLoopbackOrigin(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.Hostname() == "" {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return u.Hostname() == "localhost" || (ip != nil && ip.IsLoopback())
 }
 
 func (a *app) login(ctx context.Context, args []string) error {
@@ -364,7 +456,7 @@ func (a *app) sync(ctx context.Context, args []string) error {
 	var students stringList
 	fs.Var(&students, "student", "student enrolment ID; repeat for several students")
 	currentOnly := fs.Bool("current", false, "discover and sync every current enrolment")
-	force := fs.Bool("force", false, "sync even if the last sync was less than 30 minutes ago")
+	force := fs.Bool("force", false, "bypass only the local minimum check interval")
 	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -416,8 +508,12 @@ func (a *app) sync(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if !*force && !previous.FetchedAt.IsZero() && time.Since(previous.FetchedAt) < 30*time.Minute {
-		return fmt.Errorf("last sync was %s ago; wait 30 minutes or use --force deliberately", time.Since(previous.FetchedAt).Round(time.Second))
+	minimum, err := configuredMinimumCheckInterval()
+	if err != nil {
+		return err
+	}
+	if !*force && !previous.FetchedAt.IsZero() && time.Since(previous.FetchedAt) < minimum {
+		return fmt.Errorf("last sync was %s ago; wait %s or use --force deliberately", time.Since(previous.FetchedAt).Round(time.Second), minimum)
 	}
 	snapshot := model.Snapshot{SchemaVersion: model.SchemaVersion, FetchedAt: time.Now(), Students: []model.StudentData{}}
 	for _, studentID := range students {
@@ -503,7 +599,7 @@ func (a *app) status(args []string) error {
 			return err
 		}
 		var contractStatus checkStatus
-		err := store.LoadSnapshot(filepath.Join(a.dir, "profiles", *profile, "check-status.json"), &contractStatus)
+		err := store.LoadSnapshot(a.checkStatusPath(*profile), &contractStatus)
 		if os.IsNotExist(err) {
 			return output(map[string]any{"schema_version": checkSchemaVersion, "history": "unavailable", "latest_attempt": nil, "last_success": nil})
 		}
@@ -538,26 +634,48 @@ func (a *app) status(args []string) error {
 	return output(map[string]any{"configured": true, "has_snapshot": true, "last_sync": snapshot.FetchedAt, "students": len(snapshot.Students), "request_budget": map[string]any{"date": date, "used": count, "limit": limit}})
 }
 
-func (a *app) localBudgetStatus() (string, int, int, error) {
-	limit := 100
-	if raw := os.Getenv("EDNEVNIK_DAILY_REQUEST_LIMIT"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 {
-			return "", 0, 0, errors.New("EDNEVNIK_DAILY_REQUEST_LIMIT must be a positive integer")
-		}
-		limit = parsed
+func (a *app) checkStatusPath(profile string) string {
+	if a.accountDir != "" {
+		return filepath.Join(a.accountDir, "check-status.json")
 	}
-	return throttle.NewBudget(filepath.Join(a.configDir, "request_budget.json"), limit).Status()
+	return filepath.Join(a.dir, "profiles", profile, "check-status.json")
+}
+
+func (a *app) localBudgetStatus() (string, int, int, error) {
+	if a.lease == nil {
+		return "", 0, 0, errors.New("request policy is unavailable")
+	}
+	count, limit, _, err := a.lease.Status()
+	return time.Now().UTC().Format("2006-01-02"), count, limit, err
 }
 
 func (a *app) consumerDir(consumer string) (string, error) {
+	base := a.dir
+	if a.legacyDir != "" {
+		base = a.legacyDir
+	}
 	if consumer == "" {
-		return a.dir, nil
+		if a.legacyDir != "" && legacyStateExists(a.dir) {
+			return "", fmt.Errorf("%w: files exist at %s", errUnboundLegacyState, a.dir)
+		}
+		return base, nil
 	}
 	if err := validateNamespace(consumer, "consumer"); err != nil {
 		return "", err
 	}
-	return filepath.Join(a.dir, "consumers", consumer), nil
+	if a.legacyDir != "" && legacyStateExists(filepath.Join(a.dir, "consumers", consumer)) {
+		return "", fmt.Errorf("%w: consumer %s", errUnboundLegacyState, consumer)
+	}
+	return filepath.Join(base, "consumers", consumer), nil
+}
+
+func legacyStateExists(dir string) bool {
+	for _, name := range []string{"latest.json", "changes.json", "previous.json", "checks.jsonl"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func validateNamespace(value, name string) error {
@@ -636,6 +754,50 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func commandProfile(args []string) string {
+	profile := envOr("EDNEVNIK_PROFILE", "default")
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--profile" && i+1 < len(args) {
+			profile = args[i+1]
+			i++
+			continue
+		}
+		if strings.HasPrefix(args[i], "--profile=") {
+			profile = strings.TrimPrefix(args[i], "--profile=")
+		}
+	}
+	return profile
+}
+
+func hasProfileFlag(args []string) bool {
+	for _, arg := range args[1:] {
+		if arg == "--profile" || strings.HasPrefix(arg, "--profile=") {
+			return true
+		}
+	}
+	return false
+}
+
+func configuredMinimumCheckInterval() (time.Duration, error) {
+	raw := envOr("EDNEVNIK_MIN_CHECK_INTERVAL", "30m")
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return 0, errors.New("EDNEVNIK_MIN_CHECK_INTERVAL must be a non-negative duration")
+	}
+	return d, nil
+}
+
+func classifyCoordinationError(err error) error {
+	reason, retryable, action := model.ReasonConcurrency, true, "Retry after the other command finishes."
+	if errors.Is(err, coordination.ErrBudgetExhausted) || errors.Is(err, coordination.ErrServerCooldown) {
+		reason, action = model.ReasonRefusalQuota, "Wait until the reported retry time; force does not bypass request budgets or server cooldowns."
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		reason, retryable, action = model.ReasonCancelled, true, "Retry as a new command when the cancellation or deadline condition is resolved."
+	}
+	return newContractError("", reason, err, retryable, action, 1)
 }
 
 func canonicalOrigin(raw string) string {

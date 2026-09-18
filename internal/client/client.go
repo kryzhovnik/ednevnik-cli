@@ -7,14 +7,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/kryzhovnik/ednevnik/internal/throttle"
+	"github.com/kryzhovnik/ednevnik/internal/coordination"
 )
 
 const DefaultBaseURL = "https://moj.esdnevnik.rs"
@@ -31,13 +29,12 @@ func (e *HTTPError) Error() string { return fmt.Sprintf("eDnevnik returned HTTP 
 type Client struct {
 	base        *url.URL
 	http        *http.Client
-	limiter     *throttle.Limiter
-	budget      *throttle.Budget
+	lease       *coordination.Lease
 	sessionPath string
 	userAgent   string
 }
 
-func New(baseURL, sessionPath string, interval time.Duration) (*Client, error) {
+func New(baseURL, sessionPath string, lease *coordination.Lease) (*Client, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -46,19 +43,14 @@ func New(baseURL, sessionPath string, interval time.Duration) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load session: %w", err)
 	}
-	limit := 100
-	if raw := os.Getenv("EDNEVNIK_DAILY_REQUEST_LIMIT"); raw != "" {
-		parsed, parseErr := strconv.Atoi(raw)
-		if parseErr != nil || parsed < 1 {
-			return nil, errors.New("EDNEVNIK_DAILY_REQUEST_LIMIT must be a positive integer")
-		}
-		limit = parsed
+	if lease == nil {
+		return nil, errors.New("client requires an account coordination lease")
 	}
+	transport := &policyTransport{base: http.DefaultTransport, lease: lease}
 	return &Client{
-		base:    base,
-		http:    &http.Client{Jar: jar, Timeout: 30 * time.Second},
-		limiter: throttle.New(interval), sessionPath: sessionPath,
-		budget:    throttle.NewBudget(filepath.Join(filepath.Dir(sessionPath), "request_budget.json"), limit),
+		base:  base,
+		http:  &http.Client{Jar: jar, Timeout: 30 * time.Second, Transport: transport},
+		lease: lease, sessionPath: sessionPath,
 		userAgent: "ednevnik-cli/0.1 (+https://github.com/kryzhovnik/ednevnik)",
 	}, nil
 }
@@ -161,21 +153,39 @@ func (c *Client) get(ctx context.Context, path string, authenticated bool) ([]by
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
-	if err := c.budget.Take(); err != nil {
-		return nil, err
-	}
-	if err := c.limiter.Wait(req.Context()); err != nil {
-		return nil, err
-	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	return c.http.Do(req)
 }
 
-func (c *Client) BudgetStatus() (string, int, int, error) { return c.budget.Status() }
+func (c *Client) BudgetStatus() (string, int, int, error) {
+	count, limit, _, err := c.lease.Status()
+	return time.Now().UTC().Format("2006-01-02"), count, limit, err
+}
+
+type policyTransport struct {
+	base  http.RoundTripper
+	lease *coordination.Lease
+}
+
+func (t *policyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := t.lease.BeforeRequest(req.Context()); err != nil {
+		return nil, err
+	}
+	resp, err := t.base.RoundTrip(req)
+	if resp != nil {
+		if policyErr := t.lease.RecordResponse(resp); policyErr != nil {
+			if resp.Body != nil {
+				resp.Body.Close()
+			}
+			return nil, policyErr
+		}
+	}
+	return resp, err
+}
 
 func retryAfter(raw string) time.Duration {
-	if seconds, err := strconv.Atoi(raw); err == nil {
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
 		return time.Duration(seconds) * time.Second
 	}
 	if when, err := http.ParseTime(raw); err == nil && when.After(time.Now()) {

@@ -8,11 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/kryzhovnik/ednevnik/internal/client"
+	"github.com/kryzhovnik/ednevnik/internal/coordination"
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
@@ -77,6 +77,7 @@ func (a *app) check(ctx context.Context, args []string) error {
 	profile := fs.String("profile", "", "configured account/profile namespace")
 	var enrolments stringList
 	fs.Var(&enrolments, "student", "enrolment ID; repeat for several enrolments")
+	force := fs.Bool("force", false, "bypass only the local minimum check interval")
 	if err := fs.Parse(args); err != nil {
 		return newContractError("", "invalid_argument", err, false, "Fix the command arguments and retry.", 2)
 	}
@@ -101,6 +102,22 @@ func (a *app) check(ctx context.Context, args []string) error {
 		}
 	}
 	sort.Strings(selected)
+	minimum, err := configuredMinimumCheckInterval()
+	if err != nil {
+		return newContractError("", model.ReasonInvalidArgument, err, false, "Correct EDNEVNIK_MIN_CHECK_INTERVAL.", 2)
+	}
+	if !*force {
+		var prior checkStatus
+		statusErr := store.LoadSnapshot(a.checkStatusPath(*profile), &prior)
+		if statusErr == nil && prior.LatestAttempt != nil && !prior.LatestAttempt.CompletedAt.IsZero() {
+			elapsed := time.Since(prior.LatestAttempt.CompletedAt)
+			if elapsed < minimum {
+				return newContractError("", model.ReasonRefusalQuota, fmt.Errorf("minimum check interval is %s; retry in %s", minimum, (minimum-elapsed).Round(time.Second)), true, "Wait for the local interval or use --force; force still respects request budgets and server cooldowns.", 1)
+			}
+		} else if statusErr != nil && !os.IsNotExist(statusErr) {
+			return newContractError("", model.ReasonInvalidState, statusErr, false, "Preserve and repair the existing status file.", 1)
+		}
+	}
 	now := time.Now().UTC()
 	checkID, err := newCheckID()
 	if err != nil {
@@ -276,6 +293,24 @@ func liveReadFailure(err error) error {
 	if errors.Is(err, client.ErrNotAuthenticated) {
 		return &checkFailure{Reason: "authentication_provider", Err: err, Action: "Select a supported credential provider and authenticate the configured profile."}
 	}
+	var httpErr *client.HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode == 429 || httpErr.StatusCode == 503 {
+			retryAt := time.Now().UTC().Add(httpErr.RetryAfter)
+			return &checkFailure{Reason: model.ReasonRefusalQuota, Err: err, Retryable: true, RetryAfter: &retryAt, Action: "Respect the persisted server cooldown before retrying."}
+		}
+		if httpErr.StatusCode == 401 || httpErr.StatusCode == 403 {
+			return &checkFailure{Reason: model.ReasonAuthenticationProvider, Err: err, Action: "Authenticate the selected account once; do not retry the rejected credentials automatically."}
+		}
+	}
+	var refusal *coordination.Refusal
+	if errors.As(err, &refusal) {
+		retryAt := refusal.RetryAt
+		return &checkFailure{Reason: model.ReasonRefusalQuota, Err: err, Retryable: true, RetryAfter: &retryAt, Action: "Wait until the reported retry time; force does not bypass request budgets or server cooldowns."}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &checkFailure{Reason: model.ReasonCancelled, Err: err, Retryable: true, Action: "Retry as a new check after the cancellation or deadline condition is resolved."}
+	}
 	return err
 }
 
@@ -308,7 +343,7 @@ func (a *app) recordCheckStatus(result checkResult) error {
 	if result.Profile.ID == "" || result.Profile.Origin == "" {
 		return errors.New("check result has no account/profile origin namespace")
 	}
-	path := filepath.Join(a.dir, "profiles", result.Profile.ID, "check-status.json")
+	path := a.checkStatusPath(result.Profile.ID)
 	var status checkStatus
 	exists := true
 	if err := store.LoadSnapshot(path, &status); err != nil {
