@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -63,6 +64,11 @@ func (e *checkFailure) Unwrap() error { return e.Err }
 func (e *commandError) Error() string { return e.body.Message }
 
 type exitStatus struct{ code int }
+
+type invalidCheckStatusError struct{ err error }
+
+func (e *invalidCheckStatusError) Error() string { return e.err.Error() }
+func (e *invalidCheckStatusError) Unwrap() error { return e.err }
 
 func (e *exitStatus) Error() string { return fmt.Sprintf("exit status %d", e.code) }
 
@@ -127,6 +133,10 @@ func (a *app) check(ctx context.Context, args []string) error {
 		return a.failCheck(req, newContractError(req.CheckID, "invalid_state", err, false, "Do not consume this result; repair the check implementation or local state.", 1))
 	}
 	if err := a.recordCheckStatus(result); err != nil {
+		var invalid *invalidCheckStatusError
+		if errors.As(err, &invalid) {
+			return newContractError(req.CheckID, model.ReasonInvalidState, errors.New("existing check status is invalid or belongs to another account/profile origin"), false, "Preserve the file and migrate or recover it explicitly.", 1)
+		}
 		return newContractError(req.CheckID, "io", err, true, "Check local state permissions and free space, then retry.", 1)
 	}
 	if err := output(result); err != nil {
@@ -145,6 +155,10 @@ func (a *app) failCheck(req checkRequest, ce *commandError) error {
 	ce.body.Requested = failed.Requested
 	ce.body.Coverage = failed.Coverage
 	if err := a.recordCheckStatus(failed); err != nil {
+		var invalid *invalidCheckStatusError
+		if errors.As(err, &invalid) {
+			return newContractError(req.CheckID, model.ReasonInvalidState, errors.New("existing check status is invalid or belongs to another account/profile origin"), false, "Preserve the file and migrate or recover it explicitly.", 1)
+		}
 		return newContractError(req.CheckID, "io", err, true, "Preserve the prior state and repair local storage before retrying.", 1)
 	}
 	return ce
@@ -153,7 +167,10 @@ func (a *app) failCheck(req checkRequest, ce *commandError) error {
 func validateCheckResult(result checkResult) error {
 	switch result.Outcome {
 	case model.OutcomeIncomplete:
-		return nil
+		if result.Baseline.ID != "" || result.Baseline.PreviousID != "" || result.Changes.Count != 0 || len(result.Changes.Items) != 0 {
+			return errors.New("incomplete result claims a committed baseline or changes")
+		}
+		return validateRequestedCoverage(result, false)
 	case model.OutcomeInitialBaseline, model.OutcomeCompleteWithChanges, model.OutcomeCompleteWithoutChanges:
 	default:
 		return fmt.Errorf("unsupported check outcome %q", result.Outcome)
@@ -167,8 +184,15 @@ func validateCheckResult(result checkResult) error {
 	if result.Outcome == model.OutcomeCompleteWithoutChanges && result.Changes.Count != 0 {
 		return errors.New("unchanged result contains changes")
 	}
+	return validateRequestedCoverage(result, true)
+}
+
+func validateRequestedCoverage(result checkResult, requireComplete bool) error {
 	byID := make(map[string]enrolmentCoverage, len(result.Coverage))
 	for _, coverage := range result.Coverage {
+		if _, exists := byID[coverage.EnrolmentID]; exists {
+			return fmt.Errorf("duplicate coverage for enrolment %s", coverage.EnrolmentID)
+		}
 		byID[coverage.EnrolmentID] = coverage
 	}
 	for _, id := range result.Requested {
@@ -181,12 +205,24 @@ func validateCheckResult(result checkResult) error {
 			sections[section.Name] = section.State
 		}
 		for _, required := range []string{"grades", "absences", "timeline"} {
-			if sections[required] != "complete" {
+			if requireComplete && sections[required] != "complete" {
 				return fmt.Errorf("complete result lacks complete %s coverage for enrolment %s", required, id)
 			}
 		}
-		if coverage.Continuity.State != "complete" {
+		if requireComplete && coverage.Continuity.State != "complete" {
 			return fmt.Errorf("complete result lacks continuity for enrolment %s", id)
+		}
+	}
+	for id := range byID {
+		found := false
+		for _, requested := range result.Requested {
+			if requested == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("coverage contains unrequested enrolment %s", id)
 		}
 	}
 	return nil
@@ -270,12 +306,24 @@ func (a *app) recordCheckStatus(result checkResult) error {
 		return errors.New("check result has no account/profile origin namespace")
 	}
 	path := filepath.Join(a.dir, "profiles", result.Profile.ID, "check-status.json")
-	status := checkStatus{SchemaVersion: checkSchemaVersion, History: "latest_attempt_only"}
-	if err := store.LoadSnapshot(path, &status); err != nil && !os.IsNotExist(err) {
-		return err
+	var status checkStatus
+	exists := true
+	if err := store.LoadSnapshot(path, &status); err != nil {
+		if os.IsNotExist(err) {
+			exists = false
+		} else {
+			var syntaxErr *json.SyntaxError
+			var typeErr *json.UnmarshalTypeError
+			if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+				return &invalidCheckStatusError{err: err}
+			}
+			return err
+		}
 	}
-	if status.LatestAttempt != nil && (status.SchemaVersion != checkSchemaVersion || status.LatestAttempt.Profile.ID != result.Profile.ID || status.LatestAttempt.Profile.Origin != result.Profile.Origin) {
-		return errors.New("existing check status belongs to an unsupported schema or different account/profile origin")
+	if exists {
+		if err := validateCheckStatus(status, result.Profile.ID, result.Profile.Origin); err != nil {
+			return &invalidCheckStatusError{err: err}
+		}
 	}
 	status.SchemaVersion = checkSchemaVersion
 	status.History = "latest_attempt_only"
@@ -284,6 +332,48 @@ func (a *app) recordCheckStatus(result checkResult) error {
 		status.LastSuccess = &result
 	}
 	return store.SaveSnapshot(path, status)
+}
+
+func validateCheckStatus(status checkStatus, profileID, origin string) error {
+	if status.SchemaVersion != checkSchemaVersion || status.History != "latest_attempt_only" || status.LatestAttempt == nil {
+		return errors.New("unsupported check status envelope")
+	}
+	validateBinding := func(result *checkResult) error {
+		if result.Profile.ID != profileID || result.Profile.Origin != origin || result.CheckID == "" {
+			return errors.New("check status account/profile origin mismatch")
+		}
+		return nil
+	}
+	if err := validateBinding(status.LatestAttempt); err != nil {
+		return err
+	}
+	switch status.LatestAttempt.Outcome {
+	case model.OutcomeInitialBaseline, model.OutcomeCompleteWithChanges, model.OutcomeCompleteWithoutChanges, model.OutcomeIncomplete, model.OutcomeFailed:
+	default:
+		return errors.New("unsupported latest-attempt outcome")
+	}
+	if status.LatestAttempt.Outcome != model.OutcomeFailed {
+		if err := validateCheckResult(*status.LatestAttempt); err != nil {
+			return err
+		}
+	}
+	if status.LatestAttempt.Outcome == model.OutcomeFailed && (status.LatestAttempt.Failure == nil || status.LatestAttempt.Failure.Reason == "") {
+		return errors.New("failed latest attempt has no reason")
+	}
+	if status.LastSuccess != nil {
+		if err := validateBinding(status.LastSuccess); err != nil {
+			return err
+		}
+		switch status.LastSuccess.Outcome {
+		case model.OutcomeInitialBaseline, model.OutcomeCompleteWithChanges, model.OutcomeCompleteWithoutChanges:
+		default:
+			return errors.New("last success has a non-success outcome")
+		}
+		if err := validateCheckResult(*status.LastSuccess); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newCheckID() (string, error) {

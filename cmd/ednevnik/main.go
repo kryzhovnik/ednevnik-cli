@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -94,13 +95,28 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	dir := filepath.Join(configDir, "ednevnik")
+	testLoopback := os.Getenv("EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK") == "1"
+	if testLoopback {
+		testRoot := os.Getenv("EDNEVNIK_TEST_STATE_ROOT")
+		if !filepath.IsAbs(testRoot) {
+			return newContractError("", model.ReasonInvalidArgument, errors.New("loopback test transport requires an absolute isolated state root"), false, "Set EDNEVNIK_TEST_STATE_ROOT to a temporary absolute directory.", 2)
+		}
+		dir = testRoot
+	}
 	stateDir := envOr("EDNEVNIK_STATE_DIR", dir)
 	baseURL := envOr("EDNEVNIK_BASE_URL", client.DefaultBaseURL)
+	origin, err := validateConfiguredOrigin(baseURL, testLoopback)
+	if err != nil {
+		return newContractError("", model.ReasonInvalidArgument, errors.New("EDNEVNIK_BASE_URL must be a canonical HTTPS origin without credentials, path, query, or fragment"), false, "Set EDNEVNIK_BASE_URL to the authorized portal HTTPS origin.", 2)
+	}
 	c, err := client.New(baseURL, filepath.Join(dir, "session.json"), 2500*time.Millisecond)
 	if err != nil {
 		return err
 	}
-	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}, origin: canonicalOrigin(baseURL), configDir: dir}
+	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}, origin: origin, configDir: dir}
+	if testLoopback {
+		a.creds = nil
+	}
 
 	switch args[0] {
 	case "login":
@@ -477,7 +493,7 @@ func (a *app) status(args []string) error {
 		if err != nil {
 			return newContractError("", model.ReasonInvalidState, err, false, "Preserve the file and repair or migrate local state.", 1)
 		}
-		if contractStatus.SchemaVersion != checkSchemaVersion || contractStatus.LatestAttempt == nil || a.origin == "" || contractStatus.LatestAttempt.Profile.ID != *profile || contractStatus.LatestAttempt.Profile.Origin != a.origin {
+		if a.origin == "" || validateCheckStatus(contractStatus, *profile, a.origin) != nil {
 			return newContractError("", model.ReasonInvalidState, errors.New("status state has an unsupported schema or account/profile origin"), false, "Preserve the file and use the matching profile and portal origin, or migrate it explicitly.", 1)
 		}
 		return output(contractStatus)
@@ -611,6 +627,19 @@ func canonicalOrigin(raw string) string {
 		return ""
 	}
 	return (&url.URL{Scheme: strings.ToLower(u.Scheme), Host: strings.ToLower(u.Host)}).String()
+}
+
+func validateConfiguredOrigin(raw string, allowTestLoopback bool) (string, error) {
+	u, err := url.Parse(raw)
+	validScheme := u != nil && u.Scheme == "https"
+	if u != nil && allowTestLoopback && u.Scheme == "http" {
+		ip := net.ParseIP(u.Hostname())
+		validScheme = u.Hostname() == "localhost" || (ip != nil && ip.IsLoopback())
+	}
+	if err != nil || !validScheme || u.Host == "" || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("invalid portal origin")
+	}
+	return canonicalOrigin(raw), nil
 }
 
 func usage() {

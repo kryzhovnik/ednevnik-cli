@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -132,6 +134,22 @@ func TestCheckContractInjectedErrorRecordsFailedAttempt(t *testing.T) {
 	}
 }
 
+func TestCheckRejectsInconsistentIncompleteResult(t *testing.T) {
+	dir := t.TempDir()
+	a := &app{dir: dir, origin: "https://portal.example", checker: scriptedCheckRunner{result: checkResult{
+		Outcome:  model.OutcomeIncomplete,
+		Baseline: baselineReference{ID: "must-not-commit"},
+		Coverage: []enrolmentCoverage{{EnrolmentID: "1234567", Sections: []sectionCoverage{}, Continuity: continuityCoverage{State: "incomplete"}}},
+	}}}
+	_, err := captureStdout(t, func() error {
+		return a.check(context.Background(), []string{"--profile", "family", "--student", "1234567"})
+	})
+	var got *commandError
+	if !errors.As(err, &got) || got.body.Reason != model.ReasonInvalidState {
+		t.Fatalf("err=%#v", err)
+	}
+}
+
 func TestLiveCheckUsesCurrentParsersAndReportsIncompleteContinuity(t *testing.T) {
 	dir := t.TempDir()
 	a := &app{dir: dir, origin: "https://portal.example", client: &fakeClient{}}
@@ -156,8 +174,8 @@ func TestLiveCheckUsesCurrentParsersAndReportsIncompleteContinuity(t *testing.T)
 
 func TestStatusIsLocalAndSeparatesLatestAttemptFromLastSuccess(t *testing.T) {
 	dir := t.TempDir()
-	success := checkResult{SchemaVersion: 3, CheckID: "ok", Outcome: "complete_without_changes", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
-	failed := checkResult{SchemaVersion: 3, CheckID: "failed", Outcome: "failed", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
+	success := checkResult{SchemaVersion: 3, CheckID: "ok", Outcome: "complete_without_changes", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{ID: "baseline-1", NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
+	failed := checkResult{SchemaVersion: 3, CheckID: "failed", Outcome: "failed", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Failure: &model.FailureSummary{Reason: "io"}}
 	a := &app{dir: dir, origin: "https://portal.example"}
 	if err := a.recordCheckStatus(success); err != nil {
 		t.Fatal(err)
@@ -175,6 +193,31 @@ func TestStatusIsLocalAndSeparatesLatestAttemptFromLastSuccess(t *testing.T) {
 	}
 	if got.LatestAttempt.CheckID != "failed" || got.LastSuccess.CheckID != "ok" {
 		t.Fatalf("status=%#v", got)
+	}
+}
+
+func TestRecordCheckStatusPreservesUnsupportedExistingState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profiles", "family", "check-status.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("{}\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{dir: dir, origin: "https://portal.example"}
+	result := checkResult{SchemaVersion: 3, CheckID: "new", Outcome: model.OutcomeIncomplete, Profile: checkProfile{ID: "family", Origin: a.origin}, Coverage: []enrolmentCoverage{}, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
+	var invalid *invalidCheckStatusError
+	if err := a.recordCheckStatus(result); !errors.As(err, &invalid) {
+		t.Fatalf("err=%v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("state changed: %q", got)
 	}
 }
 
@@ -199,6 +242,92 @@ func TestProcessErrorsAreJSONOnly(t *testing.T) {
 		var got contractError
 		if err := json.Unmarshal(stderr.Bytes(), &got); err != nil || got.Reason != "invalid_argument" {
 			t.Fatalf("args=%v stderr=%q err=%v", args, stderr.String(), err)
+		}
+	}
+	cmd := exec.Command(binary, "students")
+	cmd.Env = append(os.Environ(), "EDNEVNIK_BASE_URL=https://user:do-not-echo@example.test/path?secret=yes")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 || strings.Contains(stderr.String(), "do-not-echo") || strings.Contains(stderr.String(), "secret=yes") {
+		t.Fatalf("unsafe origin error: %q", stderr.String())
+	}
+	var got contractError
+	if err := json.Unmarshal(stderr.Bytes(), &got); err != nil || got.Reason != model.ReasonInvalidArgument {
+		t.Fatalf("stderr=%q err=%v", stderr.String(), err)
+	}
+}
+
+func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+
+	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/grades":
+			_, _ = w.Write([]byte(`<a class="flex-table-row" href="/grades/7654321/show?student=1234567"><div><strong class="d-block">Mathematics</strong></div></a>`))
+		case "/absents":
+			_, _ = w.Write([]byte(`<div class="categories-wrap"></div>`))
+		case "/timeline-data":
+			_, _ = w.Write([]byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer portal.Close()
+	configDir, stateDir := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(configDir, "ednevnik"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "ednevnik", "session.json"), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
+	cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 || stderr.Len() != 0 {
+		t.Fatalf("err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	var incomplete checkResult
+	if err := json.Unmarshal(stdout.Bytes(), &incomplete); err != nil || incomplete.Outcome != model.OutcomeIncomplete {
+		t.Fatalf("stdout=%q err=%v", stdout.String(), err)
+	}
+
+	invalidPath := filepath.Join(stateDir, "profiles", "family", "check-status.json")
+	if err := os.WriteFile(invalidPath, []byte(`{"schema_version":99}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command(binary, "status", "--profile", "family")
+	cmd.Env = append(os.Environ(), "EDNEVNIK_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err = cmd.Run()
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout.Len() != 0 {
+		t.Fatalf("err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	var contractErr contractError
+	if err := json.Unmarshal(stderr.Bytes(), &contractErr); err != nil || contractErr.Reason != model.ReasonInvalidState {
+		t.Fatalf("stderr=%q err=%v", stderr.String(), err)
+	}
+
+	for _, args := range [][]string{{"help"}, {"version"}, {"status"}, {"changes"}} {
+		cmd = exec.Command(binary, args...)
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configDir, "EDNEVNIK_STATE_DIR="+t.TempDir(), "EDNEVNIK_BASE_URL=://invalid")
+		err = cmd.Run()
+		if args[0] != "changes" && err != nil {
+			t.Fatalf("local command %v read invalid configuration: %v", args, err)
+		}
+		if args[0] == "changes" && err == nil {
+			t.Fatal("changes unexpectedly found state")
 		}
 	}
 }
