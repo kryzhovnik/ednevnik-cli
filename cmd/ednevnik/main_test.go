@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/kryzhovnik/ednevnik/internal/client"
 	"github.com/kryzhovnik/ednevnik/internal/model"
@@ -32,6 +36,171 @@ func (f *fakeClient) Get(_ context.Context, path string) ([]byte, error) {
 		return []byte(`{"success":true,"meta":{"currentPage":1,"nextPage":null,"lastPage":1},"data":[]}`), nil
 	}
 	return nil, os.ErrNotExist
+}
+
+type scriptedCheckRunner struct {
+	result checkResult
+	err    error
+}
+
+func (r scriptedCheckRunner) Check(context.Context, checkRequest) (checkResult, error) {
+	return r.result, r.err
+}
+
+func captureStdout(t *testing.T, fn func() error) ([]byte, error) {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	runErr := fn()
+	_ = w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	_, err = buf.ReadFrom(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes(), runErr
+}
+
+func TestCheckContractScriptedOutcomes(t *testing.T) {
+	tests := []struct {
+		name, outcome string
+		count         int
+	}{
+		{name: "initial", outcome: "initial_baseline"},
+		{name: "unchanged", outcome: "complete_without_changes"},
+		{name: "changed", outcome: "complete_with_changes", count: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			result := checkResult{
+				Outcome:  tt.outcome,
+				Coverage: []enrolmentCoverage{{EnrolmentID: "1234567", Sections: []sectionCoverage{{Name: "grades", State: "complete", Representation: "overview"}, {Name: "absences", State: "complete", Representation: "current_records"}, {Name: "timeline", State: "complete", Representation: "caught_up_pages"}}, Continuity: continuityCoverage{State: "complete"}}},
+				Baseline: baselineReference{ID: "baseline-1"},
+				Changes:  changeSummary{Count: tt.count, Items: []model.Change{}},
+				Guidance: guidance{Action: "Read retained events with the consumer batch command when available."},
+			}
+			a := &app{dir: dir, origin: "https://portal.example", checker: scriptedCheckRunner{result: result}}
+			data, err := captureStdout(t, func() error {
+				return a.check(context.Background(), []string{"--profile", "family", "--student", "1234567", "--student", "1234567"})
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got checkResult
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.SchemaVersion != 3 || got.Outcome != tt.outcome || len(got.Requested) != 1 || got.Profile.ID != "family" || got.Profile.Origin != "https://portal.example" {
+				t.Fatalf("result=%#v", got)
+			}
+			var status checkStatus
+			if err := store.LoadSnapshot(filepath.Join(dir, "profiles", "family", "check-status.json"), &status); err != nil {
+				t.Fatal(err)
+			}
+			if status.LastSuccess == nil || status.LatestAttempt == nil || status.History != "latest_attempt_only" {
+				t.Fatalf("status=%#v", status)
+			}
+		})
+	}
+}
+
+func TestCheckContractInjectedErrorRecordsFailedAttempt(t *testing.T) {
+	dir := t.TempDir()
+	a := &app{dir: dir, origin: "https://portal.example", checker: scriptedCheckRunner{err: &checkFailure{Reason: "refusal_quota", Err: errors.New("daily request budget exhausted"), Retryable: true, Action: "Retry after the local reset time."}}}
+	_, err := captureStdout(t, func() error {
+		return a.check(context.Background(), []string{"--profile", "family", "--student", "1234567"})
+	})
+	var got *commandError
+	if !errors.As(err, &got) || got.body.Reason != "refusal_quota" {
+		t.Fatalf("err=%#v", err)
+	}
+	if got.body.Profile == nil || got.body.Profile.ID != "family" || len(got.body.Requested) != 1 {
+		t.Fatalf("error contract=%#v", got.body)
+	}
+	var status checkStatus
+	if err := store.LoadSnapshot(filepath.Join(dir, "profiles", "family", "check-status.json"), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.LatestAttempt == nil || status.LatestAttempt.Outcome != "failed" || status.LatestAttempt.Failure == nil || status.LatestAttempt.Failure.Reason != "refusal_quota" || status.LastSuccess != nil {
+		t.Fatalf("status=%#v", status)
+	}
+}
+
+func TestLiveCheckUsesCurrentParsersAndReportsIncompleteContinuity(t *testing.T) {
+	dir := t.TempDir()
+	a := &app{dir: dir, origin: "https://portal.example", client: &fakeClient{}}
+	data, err := captureStdout(t, func() error {
+		return a.check(context.Background(), []string{"--profile", "family", "--student", "1234567"})
+	})
+	var statusErr *exitStatus
+	if !errors.As(err, &statusErr) || statusErr.code != 3 {
+		t.Fatalf("err=%#v", err)
+	}
+	var got checkResult
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Outcome != "incomplete" || got.Coverage[0].Continuity.Reason != "timeline_catch_up_not_implemented" || got.Baseline.ID != "" {
+		t.Fatalf("result=%#v", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "latest.json")); !os.IsNotExist(err) {
+		t.Fatalf("live check committed legacy baseline: %v", err)
+	}
+}
+
+func TestStatusIsLocalAndSeparatesLatestAttemptFromLastSuccess(t *testing.T) {
+	dir := t.TempDir()
+	success := checkResult{SchemaVersion: 3, CheckID: "ok", Outcome: "complete_without_changes", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
+	failed := checkResult{SchemaVersion: 3, CheckID: "failed", Outcome: "failed", Profile: checkProfile{ID: "family", Origin: "https://portal.example"}, CompletedAt: time.Now(), Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}}
+	a := &app{dir: dir, origin: "https://portal.example"}
+	if err := a.recordCheckStatus(success); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.recordCheckStatus(failed); err != nil {
+		t.Fatal(err)
+	}
+	data, err := captureStdout(t, func() error { return a.status([]string{"--profile", "family"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got checkStatus
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.LatestAttempt.CheckID != "failed" || got.LastSuccess.CheckID != "ok" {
+		t.Fatalf("status=%#v", got)
+	}
+}
+
+func TestProcessErrorsAreJSONOnly(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	for _, args := range [][]string{nil, {"unknown"}, {"check", "--bad-flag"}} {
+		cmd := exec.Command(binary, args...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+			t.Fatalf("args=%v err=%v", args, err)
+		}
+		if stdout.Len() != 0 || strings.Count(strings.TrimSpace(stderr.String()), "\n") != 0 {
+			t.Fatalf("args=%v stdout=%q stderr=%q", args, stdout.String(), stderr.String())
+		}
+		var got contractError
+		if err := json.Unmarshal(stderr.Bytes(), &got); err != nil || got.Reason != "invalid_argument" {
+			t.Fatalf("args=%v stderr=%q err=%v", args, stderr.String(), err)
+		}
+	}
 }
 
 type retryClient struct {

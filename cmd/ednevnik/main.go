@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,15 +21,19 @@ import (
 	"github.com/kryzhovnik/ednevnik/internal/model"
 	"github.com/kryzhovnik/ednevnik/internal/parse"
 	"github.com/kryzhovnik/ednevnik/internal/store"
+	"github.com/kryzhovnik/ednevnik/internal/throttle"
 	"golang.org/x/term"
 )
 
 const version = "0.1.0-dev"
 
 type app struct {
-	client siteClient
-	dir    string
-	creds  credentialStore
+	client    siteClient
+	dir       string
+	creds     credentialStore
+	checker   checkRunner
+	origin    string
+	configDir string
 }
 
 type credentialStore interface {
@@ -44,15 +49,45 @@ type siteClient interface {
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		var silent *exitStatus
+		if errors.As(err, &silent) {
+			os.Exit(silent.code)
+		}
+		var structured *commandError
+		if errors.As(err, &structured) {
+			_ = json.NewEncoder(os.Stderr).Encode(structured.body)
+			os.Exit(structured.code)
+		}
+		fallback := newContractError("", "io", err, true, "Retry after checking local configuration and I/O.", 1)
+		_ = json.NewEncoder(os.Stderr).Encode(fallback.body)
+		os.Exit(fallback.code)
 	}
 }
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
+		return newContractError("", "invalid_argument", flag.ErrHelp, false, "Choose a command shown in help.", 2)
+	}
+	// These commands are local and must remain available even when session or
+	// portal configuration is invalid.
+	switch args[0] {
+	case "version":
+		fmt.Println(version)
+		return nil
+	case "help", "-h", "--help":
 		usage()
-		return flag.ErrHelp
+		return nil
+	case "status", "changes":
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return err
+		}
+		appDir := filepath.Join(configDir, "ednevnik")
+		local := &app{dir: envOr("EDNEVNIK_STATE_DIR", appDir), configDir: appDir, origin: canonicalOrigin(envOr("EDNEVNIK_BASE_URL", client.DefaultBaseURL))}
+		if args[0] == "status" {
+			return local.status(args[1:])
+		}
+		return local.changes(args[1:])
 	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
@@ -65,7 +100,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}}
+	a := &app{client: c, dir: stateDir, creds: credentials.Keychain{}, origin: canonicalOrigin(baseURL), configDir: dir}
 
 	switch args[0] {
 	case "login":
@@ -84,24 +119,18 @@ func run(ctx context.Context, args []string) error {
 		return a.page(ctx, args[1:])
 	case "sync":
 		return a.sync(ctx, args[1:])
-	case "changes":
-		return a.changes(args[1:])
-	case "status":
-		return a.status(args[1:])
-	case "version":
-		fmt.Println(version)
-		return nil
-	case "help", "-h", "--help":
-		usage()
-		return nil
+	case "check":
+		// Check is noninteractive. Credential-provider selection is added by the
+		// authentication slice; this staged command never invokes Keychain.
+		a.creds = nil
+		return a.check(ctx, args[1:])
 	default:
-		usage()
-		return fmt.Errorf("unknown command %q", args[0])
+		return newContractError("", "invalid_argument", fmt.Errorf("unknown command %q", args[0]), false, "Choose a command shown in help.", 2)
 	}
 }
 
 func (a *app) login(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	fs := commandFlagSet("login")
 	save := fs.Bool("save", false, "save credentials in macOS Keychain for automatic re-login")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -245,7 +274,7 @@ func (a *app) absences(ctx context.Context, args []string) error {
 }
 
 func (a *app) timeline(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("timeline", flag.ContinueOnError)
+	fs := commandFlagSet("timeline")
 	studentID := fs.String("student", "", "student enrolment ID")
 	pageNumber := fs.Int("page", 1, "timeline page to fetch")
 	allPages := fs.Bool("all", false, "fetch all available timeline pages")
@@ -290,7 +319,7 @@ func (a *app) loadTimeline(ctx context.Context, studentID string, page int) (mod
 }
 
 func (a *app) page(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("page", flag.ContinueOnError)
+	fs := commandFlagSet("page")
 	path := fs.String("path", "", "site-relative path to fetch")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -310,7 +339,7 @@ func (a *app) page(ctx context.Context, args []string) error {
 }
 
 func (a *app) sync(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
+	fs := commandFlagSet("sync")
 	var students stringList
 	fs.Var(&students, "student", "student enrolment ID; repeat for several students")
 	currentOnly := fs.Bool("current", false, "discover and sync every current enrolment")
@@ -410,7 +439,7 @@ func (a *app) loadOverview(ctx context.Context, studentID string) (model.Student
 }
 
 func (a *app) changes(args []string) error {
-	fs := flag.NewFlagSet("changes", flag.ContinueOnError)
+	fs := commandFlagSet("changes")
 	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -427,40 +456,84 @@ func (a *app) changes(args []string) error {
 }
 
 func (a *app) status(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs := commandFlagSet("status")
 	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
+	profile := fs.String("profile", "", "schema-v3 account/profile namespace")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *profile != "" {
+		if *consumer != "" {
+			return errors.New("status accepts either --profile or --consumer, not both")
+		}
+		if err := validateNamespace(*profile, "profile"); err != nil {
+			return err
+		}
+		var contractStatus checkStatus
+		err := store.LoadSnapshot(filepath.Join(a.dir, "profiles", *profile, "check-status.json"), &contractStatus)
+		if os.IsNotExist(err) {
+			return output(map[string]any{"schema_version": checkSchemaVersion, "history": "unavailable", "latest_attempt": nil, "last_success": nil})
+		}
+		if err != nil {
+			return newContractError("", model.ReasonInvalidState, err, false, "Preserve the file and repair or migrate local state.", 1)
+		}
+		if contractStatus.SchemaVersion != checkSchemaVersion || contractStatus.LatestAttempt == nil || a.origin == "" || contractStatus.LatestAttempt.Profile.ID != *profile || contractStatus.LatestAttempt.Profile.Origin != a.origin {
+			return newContractError("", model.ReasonInvalidState, errors.New("status state has an unsupported schema or account/profile origin"), false, "Preserve the file and use the matching profile and portal origin, or migrate it explicitly.", 1)
+		}
+		return output(contractStatus)
 	}
 	stateDir, err := a.consumerDir(*consumer)
 	if err != nil {
 		return err
 	}
-	date, count, limit, budgetErr := a.client.BudgetStatus()
-	if budgetErr != nil {
-		return budgetErr
-	}
 	var snapshot model.Snapshot
 	err = store.LoadSnapshot(filepath.Join(stateDir, "latest.json"), &snapshot)
 	if os.IsNotExist(err) {
+		date, count, limit, budgetErr := a.localBudgetStatus()
+		if budgetErr != nil {
+			return budgetErr
+		}
 		return output(map[string]any{"configured": true, "has_snapshot": false, "request_budget": map[string]any{"date": date, "used": count, "limit": limit}})
 	}
 	if err != nil {
 		return err
 	}
+	date, count, limit, budgetErr := a.localBudgetStatus()
+	if budgetErr != nil {
+		return budgetErr
+	}
 	return output(map[string]any{"configured": true, "has_snapshot": true, "last_sync": snapshot.FetchedAt, "students": len(snapshot.Students), "request_budget": map[string]any{"date": date, "used": count, "limit": limit}})
+}
+
+func (a *app) localBudgetStatus() (string, int, int, error) {
+	limit := 100
+	if raw := os.Getenv("EDNEVNIK_DAILY_REQUEST_LIMIT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			return "", 0, 0, errors.New("EDNEVNIK_DAILY_REQUEST_LIMIT must be a positive integer")
+		}
+		limit = parsed
+	}
+	return throttle.NewBudget(filepath.Join(a.configDir, "request_budget.json"), limit).Status()
 }
 
 func (a *app) consumerDir(consumer string) (string, error) {
 	if consumer == "" {
 		return a.dir, nil
 	}
-	for _, r := range consumer {
-		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
-			return "", errors.New("consumer must contain only lowercase letters, digits, and underscores")
-		}
+	if err := validateNamespace(consumer, "consumer"); err != nil {
+		return "", err
 	}
 	return filepath.Join(a.dir, "consumers", consumer), nil
+}
+
+func validateNamespace(value, name string) error {
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return fmt.Errorf("%s must contain only lowercase letters, digits, and underscores", name)
+		}
+	}
+	return nil
 }
 
 func appendCheckHistory(path string, changes model.Changes) error {
@@ -481,7 +554,7 @@ func appendCheckHistory(path string, changes model.Changes) error {
 }
 
 func requiredStudent(args []string, name string) (string, error) {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs := commandFlagSet(name)
 	student := fs.String("student", "", "student enrolment ID")
 	if err := fs.Parse(args); err != nil {
 		return "", err
@@ -519,11 +592,25 @@ func output(v any) error {
 	return enc.Encode(v)
 }
 
+func commandFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	return fs
+}
+
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
 	}
 	return fallback
+}
+
+func canonicalOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return (&url.URL{Scheme: strings.ToLower(u.Scheme), Host: strings.ToLower(u.Host)}).String()
 }
 
 func usage() {
@@ -539,8 +626,9 @@ Usage:
   ednevnik page --path '/task-schedules?student=ID'
   ednevnik sync --current [--consumer NAME]
   ednevnik sync --student ID --student ID [--consumer NAME]
+  ednevnik check --profile NAME --student ID [--student ID]
   ednevnik changes [--consumer NAME]
-  ednevnik status [--consumer NAME]
+  ednevnik status [--profile NAME | --consumer NAME]
 
 All data commands write JSON to stdout. Snapshots, changes, and timeline pages include a schema version. Diagnostics go to stderr.`)
 }

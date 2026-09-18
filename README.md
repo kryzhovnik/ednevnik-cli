@@ -44,11 +44,20 @@ ednevnik timeline --student 1234567 --all
 ednevnik page --path '/task-schedules?student=1234567'
 ednevnik sync --current
 ednevnik sync --student 1234567 --student 2345678
+ednevnik check --profile family --student 1234567 --student 2345678
 ednevnik changes
 ednevnik status
 ```
 
 Every data command writes JSON to standard output. Errors and prompts go to standard error. `schema_version` is included in stored snapshots, change sets, and timeline pages.
+
+`check` is the staged schema-version-3 automation interface. The current live
+adapter validates the grade overview, current absences, and newest timeline page
+but reports incomplete continuity until bounded timeline catch-up is implemented.
+It does not claim or commit a complete baseline. See
+[the automation contract](docs/automation-contract.md) for outcomes, exit codes,
+coverage, migration, and downstream consumer semantics. The existing `sync` and
+`changes` commands remain schema version 2 during this transition.
 
 `timeline` reads the same JSON endpoint that the portal uses to fill its home-page timeline. Page 1 contains the newest events. Use `--page N` for a specific older page or `--all` to follow the server-provided pagination. Timeline items include grades, teacher observations, absences, and other event types. HTML fragments in notes and subtitles are converted to plain text.
 
