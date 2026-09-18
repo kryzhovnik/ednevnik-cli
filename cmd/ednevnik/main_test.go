@@ -1134,6 +1134,130 @@ func TestCommandProfileMatchesFlagPackageForms(t *testing.T) {
 	}
 }
 
+func TestConsumerReplayAcrossCLIProcesses(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(t.TempDir(), "ednevnik")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	origin := client.DefaultBaseURL
+	coord, err := coordination.New(root, coordination.Namespace{Profile: "family", Origin: origin}, coordination.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := checkstate.Store{Path: filepath.Join(coord.StateDir(), "check-state.json")}
+	profile := checkProfile{ID: "family", Origin: origin}
+	initial := successfulResult(profile, "check_seed", model.OutcomeInitialBaseline, "1234567")
+	initial.Baseline.NewEnrolments = []string{"1234567"}
+	obs := []checkstate.Observation{{EnrolmentID: "1234567", Snapshot: model.StudentData{Student: model.Student{ID: "1234567"}}, TimelineBoundary: []string{"one"}}}
+	if _, err := state.Commit(profile, initial, obs); err != nil {
+		t.Fatal(err)
+	}
+	command := func(args ...string) ([]byte, error) {
+		c := exec.Command(binary, args...)
+		c.Env = append(os.Environ(), "EDNEVNIK_STATE_DIR="+root)
+		return c.Output()
+	}
+	for _, name := range []string{"notify", "audit"} {
+		if out, err := command("consumer-register", "--profile=family", "--consumer="+name, "--start=earliest"); err != nil {
+			t.Fatalf("register %s: %v %s", name, err, out)
+		}
+	}
+	commitEvent := func(id string) {
+		r := successfulResult(profile, id, model.OutcomeCompleteWithChanges, "1234567")
+		r.Changes = model.ChangeSummary{Count: 1, Items: []model.Change{{Kind: "grade_updated", RecordKey: "grade:key", StudentID: "1234567", RecordID: "g1", Summary: id}}}
+		if _, err := state.Commit(profile, r, obs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commitEvent("check_one")
+	decode := func(b []byte) checkstate.Batch {
+		var result checkstate.Batch
+		if err := json.Unmarshal(b, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	firstBytes, err := command("consumer-read", "--profile=family", "--consumer=notify", "--limit=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := decode(firstBytes)
+	commitEvent("check_two")
+	results := make(chan checkstate.Batch, 2)
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			b, e := command("consumer-read", "--profile=family", "--consumer=notify", "--limit=10")
+			if e != nil {
+				errs <- e
+				return
+			}
+			results <- decode(b)
+		}()
+	}
+	var concurrent []checkstate.Batch
+	for i := 0; i < 2; i++ {
+		select {
+		case e := <-errs:
+			t.Fatal(e)
+		case b := <-results:
+			concurrent = append(concurrent, b)
+		}
+	}
+	for _, replay := range concurrent {
+		if replay.Token != first.Token || len(replay.Events) != 1 || replay.Events[0].ID != first.Events[0].ID {
+			t.Fatalf("unstable replay: %#v %#v", first, replay)
+		}
+	}
+	if _, err := command("consumer-ack", "--profile=family", "--consumer=notify", "--token="+first.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := command("consumer-ack", "--profile=family", "--consumer=notify", "--token="+first.Token); err != nil {
+		t.Fatalf("idempotent ack: %v", err)
+	}
+	remainingBytes, err := command("consumer-read", "--profile=family", "--consumer=notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := decode(remainingBytes)
+	auditBytes, err := command("consumer-read", "--profile=family", "--consumer=audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit := decode(auditBytes)
+	if len(remaining.Events) != 1 || len(audit.Events) != 2 {
+		t.Fatalf("remaining=%#v audit=%#v", remaining, audit)
+	}
+	for i := 0; i < checkstate.MaxConsumers-2; i++ {
+		if _, err := state.Register(profile, fmt.Sprintf("limit_%d", i), "latest"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := os.ReadFile(state.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := command("consumer-register", "--profile=family", "--consumer=overflow", "--start=latest"); err == nil {
+		t.Fatal("consumer limit was not refused")
+	}
+	after, err := os.ReadFile(state.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("storage-limit refusal changed unread state")
+	}
+	stillPending, err := state.ReadBatch(profile, "audit", 100)
+	if err != nil || len(stillPending.Events) != 2 {
+		t.Fatalf("unread backlog lost: %#v %v", stillPending, err)
+	}
+}
+
+func successfulResult(profile checkProfile, id, outcome, enrolment string) model.CheckResult {
+	return model.CheckResult{SchemaVersion: checkSchemaVersion, CheckID: id, Outcome: outcome, Profile: profile, Requested: []string{enrolment}, Coverage: []model.EnrolmentCoverage{{EnrolmentID: enrolment, Sections: []model.SectionCoverage{}, Continuity: model.ContinuityCoverage{State: "complete"}}}, StartedAt: time.Now(), CompletedAt: time.Now(), Baseline: model.BaselineReference{ID: "baseline_" + id, NewEnrolments: []string{}}, Changes: model.ChangeSummary{Items: []model.Change{}}, Guidance: model.Guidance{}}
+}
+
 func TestHelpAndVersionIgnoreInvalidPolicyEnvironment(t *testing.T) {
 	t.Setenv("EDNEVNIK_COMMAND_TIMEOUT", "invalid")
 	t.Setenv("EDNEVNIK_DAILY_REQUEST_LIMIT", "invalid")

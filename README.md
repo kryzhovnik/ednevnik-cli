@@ -47,6 +47,9 @@ ednevnik sync --student 1234567 --student 2345678
 ednevnik check --profile family --student 1234567 --student 2345678
 ednevnik changes
 ednevnik status
+ednevnik consumer-register --profile family --consumer notifier --start earliest
+ednevnik consumer-read --profile family --consumer notifier --limit 100
+ednevnik consumer-ack --profile family --consumer notifier --token TOKEN
 ```
 
 Every data command writes JSON to standard output. Errors and prompts go to standard error. `schema_version` is included in stored snapshots, change sets, and timeline pages.
@@ -90,7 +93,26 @@ ednevnik sync --current > ednevnik_snapshot.json
 ednevnik changes > ednevnik_changes.json
 ```
 
-The agent can summarize `ednevnik_changes.json` with an LLM when useful. New timeline records appear as `activity_added` changes. Fetching, parsing, caching, and comparison are deterministic and do not use LLM tokens.
+For the reliable schema-v3 route, register each automation once and replay its
+local durable queue. Save the returned `ack_token`; acknowledge it only after
+all downstream work succeeds:
+
+```sh
+ednevnik consumer-register --profile family --consumer notifier --start earliest
+ednevnik consumer-read --profile family --consumer notifier --limit 100 > batch.json
+# Deliver each event, deduplicating downstream by its stable event ID.
+ednevnik consumer-ack --profile family --consumer notifier --token "$ACK_TOKEN"
+```
+
+If delivery fails, omit the acknowledgement. A later read returns the same
+batch even after another check. Each consumer has its own cursor. These commands
+are local and do not authenticate or contact the portal. Delivery is at least
+once, so the external system must deduplicate by event ID.
+
+Legacy `changes` remains available for schema-v2 state. Schema-v3 commands
+refuse detected legacy last-diff or per-consumer files because older overwritten
+history cannot be recovered safely; archive those files before establishing a
+new schema-v3 baseline.
 
 For a direct recent-events query, an agent can avoid changing the stored snapshot:
 

@@ -166,6 +166,9 @@ func (a *app) check(ctx context.Context, args []string) error {
 	}
 	committed, err := stateStore.Commit(result.Profile, result, run.Observations)
 	if err != nil {
+		if errors.Is(err, checkstate.ErrStorageLimit) {
+			return newContractError(req.CheckID, model.ReasonStorageLimit, err, false, "Archive the private state and perform an explicit profile reset after accounting for unread events.", 1)
+		}
 		var stateInvalid *checkstate.InvalidError
 		if errors.As(err, &stateInvalid) {
 			return newContractError(req.CheckID, model.ReasonInvalidState, errors.New("existing check status is invalid or belongs to another account/profile origin"), false, "Preserve the file and migrate or recover it explicitly.", 1)
@@ -193,6 +196,9 @@ func (a *app) failCheck(req checkRequest, ce *commandError) error {
 	ce.body.Requested = failed.Requested
 	ce.body.Coverage = failed.Coverage
 	if _, err := a.checkStateStore(req.ProfileID).Commit(failed.Profile, failed, nil); err != nil {
+		if errors.Is(err, checkstate.ErrStorageLimit) {
+			return newContractError(req.CheckID, model.ReasonStorageLimit, err, false, "Archive the private state and perform an explicit profile reset after accounting for unread events.", 1)
+		}
 		var invalid *checkstate.InvalidError
 		if errors.As(err, &invalid) {
 			return newContractError(req.CheckID, model.ReasonInvalidState, errors.New("existing check status is invalid or belongs to another account/profile origin"), false, "Preserve the file and migrate or recover it explicitly.", 1)

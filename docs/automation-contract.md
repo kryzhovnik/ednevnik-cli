@@ -132,13 +132,30 @@ The implemented fallback, ambiguity, source labels, before/after fields, and
 deletion evidence rules are documented in
 [Record reconciliation semantics](record-semantics.md).
 
-The planned consumer interface is a bounded, non-destructive batch with a
-stable batch/high-water token and deterministic event order. Acknowledgement
-advances only the named consumer through that exact batch, is idempotent, and
-cannot acknowledge events committed after the batch was read. Delivery is at
-least once; external notification deduplication uses event IDs. These consumer
-and durable-journal mechanisms are contract requirements, not features of this
-intermediate implementation.
+Consumers are explicitly registered with `consumer-register --start earliest`
+or `--start latest`. `earliest` starts at the first event still retained;
+`latest` ignores the current backlog. Registration never changes an existing
+consumer. `consumer-read` returns at most the requested limit (1 through 1000)
+in increasing event sequence. Until its token is acknowledged, later reads
+return that exact event range and token even when another check commits events.
+`consumer-ack` accepts only the token delivered to that named consumer. It
+cannot include later events. A repeated acknowledgement remains successful
+while the token is retained in the consumer's finite history.
+
+Retrieval is at least once. A process that fails after reading must retry the
+same batch. An external notifier must deduplicate effects by stable event ID;
+the CLI cannot make an external effect exactly once. Consumers have independent
+cursors and all consumer operations are local: they take the shared account
+lease, update the same atomic document as checks and baselines, and do not load
+credentials, create a portal client, or run an implicit sync.
+
+The document has explicit limits: 16 MiB encoded size, 10,000 retained events,
+32 consumers, 100,000 durable source/ambiguity identity entries, 1,024 retained
+acknowledgement tokens per consumer, and a maximum batch of 1,000 events. This
+beta does not automatically delete journal or identity history. Reaching a
+limit refuses the check or consumer mutation without replacing the prior
+generation. Recovery requires a private archive and an explicitly chosen
+profile reset after unread events are accounted for; there is no silent loss.
 
 Schema-v2 commands remain usable during the transition. Schema-v3 `check` and
 profile status deliberately refuse known root, per-consumer, namespaced-v2, or
@@ -155,9 +172,9 @@ It contains per-enrolment baselines, retained ordered transition envelopes,
 latest attempt, and last success. Incomplete and failed attempts update only
 attempt evidence. Selected subsets do not replace unselected baselines.
 Transition envelopes include an event ID, sequence, revision, and producing
-check ID; slice 07 supplies final record semantics. There is no automatic event
-cleanup in this slice. Consumer retrieval, acknowledgement, and a finite
-retention policy remain slice 11 work.
+check ID. There is no automatic event cleanup. The finite refusal policy above
+preserves unread events and the durable identity maps used to detect later
+corrections.
 
 `sync --profile NAME --student ID` is an explicit alias for the schema-v3
 reliable check and uses the same bounded timeline catch-up and coherent commit.

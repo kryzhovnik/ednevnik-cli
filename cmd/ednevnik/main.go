@@ -211,12 +211,20 @@ func run(ctx context.Context, args []string) error {
 		return classifyCoordinationError(err)
 	}
 	defer lease.Release()
-	if args[0] == "status" || args[0] == "changes" {
+	if args[0] == "status" || args[0] == "changes" || strings.HasPrefix(args[0], "consumer-") {
 		local := &app{dir: stateDir, configDir: dir, origin: origin, lease: lease, legacyDir: filepath.Join(coordinator.StateDir(), "schema-v2"), accountDir: coordinator.StateDir()}
-		if args[0] == "status" {
+		switch args[0] {
+		case "status":
 			return local.status(args[1:])
+		case "changes":
+			return local.changes(args[1:])
+		case "consumer-register":
+			return local.consumerRegister(args[1:])
+		case "consumer-read":
+			return local.consumerRead(args[1:])
+		case "consumer-ack":
+			return local.consumerAck(args[1:])
 		}
-		return local.changes(args[1:])
 	}
 	sessionPath := filepath.Join(coordinator.StateDir(), "session.json")
 	if args[0] == "session-reset" {
@@ -787,6 +795,88 @@ func (a *app) changes(args []string) error {
 	return output(changes)
 }
 
+func (a *app) consumerRegister(args []string) error {
+	fs := commandFlagSet("consumer-register")
+	profile := fs.String("profile", "", "account/profile namespace")
+	name := fs.String("consumer", "", "consumer name")
+	start := fs.String("start", "", "earliest or latest retained event")
+	if err := fs.Parse(args); err != nil {
+		return consumerArgumentError(err)
+	}
+	if *profile == "" || *name == "" || *start == "" {
+		return consumerArgumentError(errors.New("consumer-register requires --profile, --consumer, and --start"))
+	}
+	if err := validateNamespace(*profile, "profile"); err != nil {
+		return consumerArgumentError(err)
+	}
+	if err := validateNamespace(*name, "consumer"); err != nil {
+		return consumerArgumentError(err)
+	}
+	d, err := a.checkStateStore(*profile).Register(checkProfile{ID: *profile, Origin: a.origin}, *name, *start)
+	if err != nil {
+		return consumerStateError(err)
+	}
+	return output(map[string]any{"schema_version": checkSchemaVersion, "consumer": *name, "start": *start, "acknowledged_through": d.Consumers[*name].AcknowledgedThrough})
+}
+
+func (a *app) consumerRead(args []string) error {
+	fs := commandFlagSet("consumer-read")
+	profile := fs.String("profile", "", "account/profile namespace")
+	name := fs.String("consumer", "", "consumer name")
+	limit := fs.Int("limit", 100, "maximum events in the stable batch")
+	if err := fs.Parse(args); err != nil {
+		return consumerArgumentError(err)
+	}
+	if *profile == "" || *name == "" {
+		return consumerArgumentError(errors.New("consumer-read requires --profile and --consumer"))
+	}
+	if err := validateNamespace(*profile, "profile"); err != nil {
+		return consumerArgumentError(err)
+	}
+	if err := validateNamespace(*name, "consumer"); err != nil {
+		return consumerArgumentError(err)
+	}
+	b, err := a.checkStateStore(*profile).ReadBatch(checkProfile{ID: *profile, Origin: a.origin}, *name, *limit)
+	if err != nil {
+		return consumerStateError(err)
+	}
+	return output(b)
+}
+
+func (a *app) consumerAck(args []string) error {
+	fs := commandFlagSet("consumer-ack")
+	profile := fs.String("profile", "", "account/profile namespace")
+	name := fs.String("consumer", "", "consumer name")
+	token := fs.String("token", "", "exact token returned by consumer-read")
+	if err := fs.Parse(args); err != nil {
+		return consumerArgumentError(err)
+	}
+	if *profile == "" || *name == "" || *token == "" {
+		return consumerArgumentError(errors.New("consumer-ack requires --profile, --consumer, and --token"))
+	}
+	if err := validateNamespace(*profile, "profile"); err != nil {
+		return consumerArgumentError(err)
+	}
+	if err := validateNamespace(*name, "consumer"); err != nil {
+		return consumerArgumentError(err)
+	}
+	d, err := a.checkStateStore(*profile).Acknowledge(checkProfile{ID: *profile, Origin: a.origin}, *name, *token)
+	if err != nil {
+		return consumerStateError(err)
+	}
+	return output(map[string]any{"schema_version": checkSchemaVersion, "consumer": *name, "acknowledged": true, "acknowledged_through": d.Consumers[*name].AcknowledgedThrough})
+}
+
+func consumerArgumentError(err error) error {
+	return newContractError("", model.ReasonInvalidArgument, err, false, "Correct the consumer command arguments.", 2)
+}
+func consumerStateError(err error) error {
+	if errors.Is(err, checkstate.ErrStorageLimit) {
+		return newContractError("", model.ReasonStorageLimit, err, false, "Archive the private state and perform an explicit profile reset after accounting for unread events.", 1)
+	}
+	return newContractError("", model.ReasonInvalidState, err, false, "Preserve the account state and use a registered consumer with its exact delivered token.", 1)
+}
+
 func (a *app) status(args []string) error {
 	fs := commandFlagSet("status")
 	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
@@ -1041,7 +1131,10 @@ Usage:
   ednevnik sync --student ID --student ID [--consumer NAME]
   ednevnik sync --profile NAME --student ID [--student ID]
   ednevnik check --profile NAME --student ID [--student ID]
-  ednevnik changes [--consumer NAME]
+ednevnik changes [--consumer NAME]
+  ednevnik consumer-register --profile NAME --consumer NAME --start earliest|latest
+  ednevnik consumer-read --profile NAME --consumer NAME [--limit N]
+  ednevnik consumer-ack --profile NAME --consumer NAME --token TOKEN
   ednevnik status [--profile NAME | --consumer NAME]
 
 All data commands write JSON to stdout. Snapshots, changes, and timeline pages include a schema version. Diagnostics go to stderr.`)

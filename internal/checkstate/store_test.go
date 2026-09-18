@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,6 +84,162 @@ func TestGenerationCommitIsAtomicAndRetainsEvents(t *testing.T) {
 	}
 	if d.LastSuccess.CheckID != "check_b" || len(d.Events) != 1 || d.Baselines["1111111"].CheckID != "check_b" {
 		t.Fatalf("incomplete advanced committed data: %#v", d)
+	}
+}
+
+func TestConsumerBatchReplayExactAckAndIndependentCursor(t *testing.T) {
+	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	baseline := result(profile, "check_a", model.OutcomeInitialBaseline, "1111111")
+	baseline.Baseline.NewEnrolments = []string{"1111111"}
+	if _, err := s.Commit(profile, baseline, observations("1111111")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(profile, "failed_job", "earliest"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(profile, "audit", "earliest"); err != nil {
+		t.Fatal(err)
+	}
+	add := func(id, value string) {
+		r := result(profile, id, model.OutcomeCompleteWithChanges, "1111111")
+		r.Changes = model.ChangeSummary{Count: 1, Items: []model.Change{{Kind: "grade_updated", RecordKey: "grade:one", StudentID: "1111111", RecordID: "g1", Value: value, Summary: value}}}
+		if _, err := s.Commit(profile, r, observations("1111111")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("check_b", "4")
+	first, err := s.ReadBatch(profile, "failed_job", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add("check_c", "5") // downstream failed while a later sync committed
+	replay, err := s.ReadBatch(profile, "failed_job", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.Token != first.Token || len(replay.Events) != 1 || replay.Events[0].ID != first.Events[0].ID {
+		t.Fatalf("batch changed: first=%#v replay=%#v", first, replay)
+	}
+	if _, err := s.Acknowledge(profile, "audit", first.Token); err == nil {
+		t.Fatal("foreign token accepted")
+	}
+	if _, err := s.Acknowledge(profile, "failed_job", "malformed"); err == nil {
+		t.Fatal("malformed token accepted")
+	}
+	if _, err := s.Acknowledge(profile, "failed_job", first.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Acknowledge(profile, "failed_job", first.Token); err != nil {
+		t.Fatalf("repeated ack: %v", err)
+	}
+	remaining, err := s.ReadBatch(profile, "failed_job", 100)
+	if err != nil || len(remaining.Events) != 1 || remaining.Events[0].ID == first.Events[0].ID {
+		t.Fatalf("remaining=%#v err=%v", remaining, err)
+	}
+	audit, err := s.ReadBatch(profile, "audit", 100)
+	if err != nil || len(audit.Events) != 2 {
+		t.Fatalf("independent=%#v err=%v", audit, err)
+	}
+	d, err := s.Load(profile)
+	if err != nil || len(d.Events) != 2 || len(d.Baselines["1111111"].SeenSourceRecords) != 0 {
+		t.Fatalf("document=%#v err=%v", d, err)
+	}
+}
+
+func TestSchemaV3WithoutConsumersUpgradesWithoutLosingIdentity(t *testing.T) {
+	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	r := result(profile, "check_a", model.OutcomeInitialBaseline, "1111111")
+	r.Baseline.NewEnrolments = []string{"1111111"}
+	obs := observations("1111111")
+	obs[0].SeenSourceRecords = map[string]model.RecordState{"absence:key": {RecordID: "source"}}
+	if _, err := s.Commit(profile, r, obs); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	delete(raw, "consumers")
+	b, _ = json.Marshal(raw)
+	if err := os.WriteFile(s.Path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.Load(profile)
+	if err != nil || d.Consumers == nil || d.Baselines["1111111"].SeenSourceRecords["absence:key"].RecordID != "source" {
+		t.Fatalf("document=%#v err=%v", d, err)
+	}
+}
+
+func TestFiniteDocumentAndIdentityLimitsRefuseWithoutCleanup(t *testing.T) {
+	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	r := result(profile, "check_a", model.OutcomeInitialBaseline, "1111111")
+	r.Baseline.NewEnrolments = []string{"1111111"}
+	if _, err := s.Commit(profile, r, observations("1111111")); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.Load(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := d.Baselines["1111111"]
+	b.SeenSourceRecords = make(map[string]model.RecordState, MaxIdentityEntries+1)
+	for i := 0; i <= MaxIdentityEntries; i++ {
+		b.SeenSourceRecords[fmt.Sprintf("key-%d", i)] = model.RecordState{RecordID: "source"}
+	}
+	d.Baselines["1111111"] = b
+	if err := validate(d, profile); !errors.Is(err, ErrStorageLimit) {
+		t.Fatalf("identity limit: %v", err)
+	}
+	oversized := bytes.Repeat([]byte{'x'}, MaxDocumentBytes+1)
+	if err := os.WriteFile(s.Path, oversized, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(profile); !errors.Is(err, ErrStorageLimit) {
+		t.Fatalf("read limit: %v", err)
+	}
+}
+
+func TestLoadRejectsEventGapAndPreservesCorruptDocument(t *testing.T) {
+	profile := model.CheckProfile{ID: "family", Origin: "https://portal.example"}
+	s := Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	r := result(profile, "check_a", model.OutcomeInitialBaseline, "1111111")
+	r.Baseline.NewEnrolments = []string{"1111111"}
+	if _, err := s.Commit(profile, r, observations("1111111")); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.Load(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Events = []model.RetainedEvent{{ID: "event_gap", Sequence: 2, Revision: 1, CheckID: "check_b", Change: model.Change{Kind: "grade_updated", StudentID: "1111111", RecordID: "g1"}}}
+	d.NextSequence = 3
+	b, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(profile); err == nil {
+		t.Fatal("event gap accepted")
+	}
+	after, err := os.ReadFile(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("invalid load changed the stored document")
 	}
 }
 

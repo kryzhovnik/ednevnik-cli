@@ -4,6 +4,7 @@ package checkstate
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,9 +21,17 @@ import (
 
 const SchemaVersion = 3
 
+const (
+	MaxDocumentBytes   = 16 << 20
+	MaxEvents          = 10000
+	MaxConsumers       = 32
+	MaxIdentityEntries = 100000
+)
+
 var commitTestHook func(stage string) error
 
 var ErrAbsent = errors.New("check state does not exist")
+var ErrStorageLimit = errors.New("check state storage limit reached")
 
 type InvalidError struct{ Err error }
 
@@ -66,8 +75,31 @@ type Document struct {
 	NextSequence  uint64                `json:"next_sequence"`
 	Baselines     map[string]Baseline   `json:"baselines"`
 	Events        []model.RetainedEvent `json:"events"`
+	Consumers     map[string]Consumer   `json:"consumers"`
 	LatestAttempt *model.CheckResult    `json:"latest_attempt"`
 	LastSuccess   *model.CheckResult    `json:"last_success"`
+}
+
+type Consumer struct {
+	AcknowledgedThrough uint64        `json:"acknowledged_through"`
+	Pending             *PendingBatch `json:"pending,omitempty"`
+	AcknowledgedTokens  []string      `json:"acknowledged_tokens,omitempty"`
+}
+
+type PendingBatch struct {
+	Token   string `json:"token"`
+	From    uint64 `json:"from_sequence"`
+	Through uint64 `json:"through_sequence"`
+}
+
+type Batch struct {
+	SchemaVersion int                   `json:"schema_version"`
+	Consumer      string                `json:"consumer"`
+	Token         string                `json:"ack_token,omitempty"`
+	From          uint64                `json:"from_sequence,omitempty"`
+	Through       uint64                `json:"through_sequence,omitempty"`
+	Events        []model.RetainedEvent `json:"events"`
+	More          bool                  `json:"more"`
 }
 
 type Store struct {
@@ -88,16 +120,29 @@ func (s Store) Load(profile model.CheckProfile) (Document, error) {
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return Document{}, statErr
 	}
-	b, err := os.ReadFile(s.Path)
+	f, err := os.Open(s.Path)
 	if os.IsNotExist(err) {
 		return newDocument(profile), ErrAbsent
 	}
 	if err != nil {
 		return Document{}, err
 	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, MaxDocumentBytes+1))
+	if err != nil {
+		return Document{}, err
+	}
+	if len(b) > MaxDocumentBytes {
+		return Document{}, &InvalidError{Err: fmt.Errorf("%w: document exceeds %d bytes", ErrStorageLimit, MaxDocumentBytes)}
+	}
 	var d Document
 	if err := json.Unmarshal(b, &d); err != nil {
 		return Document{}, &InvalidError{Err: err}
+	}
+	// Consumers were added to schema v3. An absent map is the compatible empty
+	// value; retained events and record identity maps remain untouched.
+	if d.Consumers == nil {
+		d.Consumers = map[string]Consumer{}
 	}
 	if err := validate(d, profile); err != nil {
 		return Document{}, &InvalidError{Err: err}
@@ -106,7 +151,7 @@ func (s Store) Load(profile model.CheckProfile) (Document, error) {
 }
 
 func newDocument(profile model.CheckProfile) Document {
-	return Document{SchemaVersion: SchemaVersion, Profile: profile, NextSequence: 1, Baselines: map[string]Baseline{}, Events: []model.RetainedEvent{}}
+	return Document{SchemaVersion: SchemaVersion, Profile: profile, NextSequence: 1, Baselines: map[string]Baseline{}, Events: []model.RetainedEvent{}, Consumers: map[string]Consumer{}}
 }
 
 func validate(d Document, profile model.CheckProfile) error {
@@ -116,7 +161,7 @@ func validate(d Document, profile model.CheckProfile) error {
 	if d.Profile != profile {
 		return errors.New("profile or portal origin does not match")
 	}
-	if d.Generation == 0 || d.NextSequence == 0 || d.Baselines == nil || d.Events == nil || d.LatestAttempt == nil {
+	if d.Generation == 0 || d.NextSequence == 0 || d.Baselines == nil || d.Events == nil || d.Consumers == nil || d.LatestAttempt == nil {
 		return errors.New("incomplete state envelope")
 	}
 	if err := validateResult(*d.LatestAttempt, profile, false); err != nil {
@@ -145,15 +190,45 @@ func validate(d Document, profile model.CheckProfile) error {
 		}
 	}
 	last := uint64(0)
+	expected := uint64(1)
 	ids := map[string]bool{}
 	for _, e := range d.Events {
-		if e.ID == "" || e.Sequence <= last || e.Revision == 0 || e.CheckID == "" || ids[e.ID] || e.Change.Kind == "" || e.Change.StudentID == "" || (e.Change.RecordID == "" && e.Change.RecordKey == "") {
+		if e.ID == "" || e.Sequence != expected || e.Revision == 0 || e.CheckID == "" || ids[e.ID] || e.Change.Kind == "" || e.Change.StudentID == "" || (e.Change.RecordID == "" && e.Change.RecordKey == "") {
 			return errors.New("invalid retained event ordering")
 		}
 		last, ids[e.ID] = e.Sequence, true
+		expected++
 	}
-	if d.NextSequence <= last {
+	if d.NextSequence != last+1 {
 		return errors.New("next event sequence does not follow retained events")
+	}
+	if len(d.Events) > MaxEvents || len(d.Consumers) > MaxConsumers {
+		return ErrStorageLimit
+	}
+	identityCount := 0
+	for _, b := range d.Baselines {
+		identityCount += len(b.UnresolvedFallbackKeys) + len(b.SeenSourceRecords)
+	}
+	if identityCount > MaxIdentityEntries {
+		return ErrStorageLimit
+	}
+	for name, c := range d.Consumers {
+		if name == "" || c.AcknowledgedThrough >= d.NextSequence {
+			return errors.New("invalid consumer cursor")
+		}
+		if len(c.AcknowledgedTokens) > 1024 {
+			return ErrStorageLimit
+		}
+		tokens := map[string]bool{}
+		for _, token := range c.AcknowledgedTokens {
+			if !validBatchToken(token) || tokens[token] {
+				return errors.New("invalid acknowledged token")
+			}
+			tokens[token] = true
+		}
+		if c.Pending != nil && (!validBatchToken(c.Pending.Token) || tokens[c.Pending.Token] || c.Pending.From != c.AcknowledgedThrough+1 || c.Pending.Through < c.Pending.From || c.Pending.Through >= d.NextSequence) {
+			return errors.New("invalid consumer pending batch")
+		}
 	}
 	return nil
 }
@@ -251,6 +326,151 @@ func (s Store) Commit(profile model.CheckProfile, result model.CheckResult, obse
 		return Document{}, err
 	}
 	return d, nil
+}
+
+func (s Store) Register(profile model.CheckProfile, name, start string) (Document, error) {
+	d, err := s.Load(profile)
+	if err != nil {
+		return Document{}, err
+	}
+	if _, exists := d.Consumers[name]; exists {
+		return Document{}, errors.New("consumer already registered")
+	}
+	if name == "" {
+		return Document{}, errors.New("consumer name is required")
+	}
+	if len(d.Consumers) >= MaxConsumers {
+		return Document{}, ErrStorageLimit
+	}
+	var cursor uint64
+	switch start {
+	case "earliest":
+		if len(d.Events) > 0 {
+			cursor = d.Events[0].Sequence - 1
+		}
+	case "latest":
+		cursor = d.NextSequence - 1
+	default:
+		return Document{}, errors.New("consumer start must be earliest or latest")
+	}
+	d.Consumers[name] = Consumer{AcknowledgedThrough: cursor}
+	d.Generation++
+	if err := validate(d, profile); err != nil {
+		return Document{}, err
+	}
+	if err := writeAtomic(s.Path, d); err != nil {
+		return Document{}, err
+	}
+	return d, nil
+}
+
+func (s Store) ReadBatch(profile model.CheckProfile, name string, limit int) (Batch, error) {
+	if limit < 1 || limit > 1000 {
+		return Batch{}, errors.New("batch limit must be between 1 and 1000")
+	}
+	d, err := s.Load(profile)
+	if err != nil {
+		return Batch{}, err
+	}
+	c, ok := d.Consumers[name]
+	if !ok {
+		return Batch{}, errors.New("consumer is not registered")
+	}
+	if c.Pending == nil {
+		items := eventsAfter(d.Events, c.AcknowledgedThrough, limit)
+		if len(items) == 0 {
+			return Batch{SchemaVersion: SchemaVersion, Consumer: name, Events: []model.RetainedEvent{}}, nil
+		}
+		token, err := newBatchToken()
+		if err != nil {
+			return Batch{}, err
+		}
+		c.Pending = &PendingBatch{Token: token, From: items[0].Sequence, Through: items[len(items)-1].Sequence}
+		d.Consumers[name] = c
+		d.Generation++
+		if err := validate(d, profile); err != nil {
+			return Batch{}, err
+		}
+		if err := writeAtomic(s.Path, d); err != nil {
+			return Batch{}, err
+		}
+	}
+	items := eventsRange(d.Events, c.Pending.From, c.Pending.Through)
+	if len(items) == 0 || items[0].Sequence != c.Pending.From || items[len(items)-1].Sequence != c.Pending.Through {
+		return Batch{}, &InvalidError{Err: errors.New("pending batch events are missing")}
+	}
+	return Batch{SchemaVersion: SchemaVersion, Consumer: name, Token: c.Pending.Token, From: c.Pending.From, Through: c.Pending.Through, Events: items, More: c.Pending.Through < d.NextSequence-1}, nil
+}
+
+func (s Store) Acknowledge(profile model.CheckProfile, name, token string) (Document, error) {
+	d, err := s.Load(profile)
+	if err != nil {
+		return Document{}, err
+	}
+	c, ok := d.Consumers[name]
+	if !ok {
+		return Document{}, errors.New("consumer is not registered")
+	}
+	if token == "" {
+		return Document{}, errors.New("ack token is required")
+	}
+	for _, acknowledged := range c.AcknowledgedTokens {
+		if token == acknowledged {
+			return d, nil
+		}
+	}
+	if c.Pending == nil || token != c.Pending.Token {
+		return Document{}, errors.New("ack token was not delivered to this consumer")
+	}
+	c.AcknowledgedThrough = c.Pending.Through
+	c.AcknowledgedTokens = append(c.AcknowledgedTokens, token)
+	if len(c.AcknowledgedTokens) > 1024 {
+		return Document{}, ErrStorageLimit
+	}
+	c.Pending = nil
+	d.Consumers[name] = c
+	d.Generation++
+	if err := validate(d, profile); err != nil {
+		return Document{}, err
+	}
+	if err := writeAtomic(s.Path, d); err != nil {
+		return Document{}, err
+	}
+	return d, nil
+}
+
+func eventsAfter(events []model.RetainedEvent, cursor uint64, limit int) []model.RetainedEvent {
+	out := make([]model.RetainedEvent, 0, limit)
+	for _, event := range events {
+		if event.Sequence > cursor {
+			out = append(out, event)
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out
+}
+func eventsRange(events []model.RetainedEvent, from, through uint64) []model.RetainedEvent {
+	out := []model.RetainedEvent{}
+	for _, event := range events {
+		if event.Sequence >= from && event.Sequence <= through {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+func newBatchToken() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func validBatchToken(token string) bool {
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	return err == nil && len(b) == 24
 }
 
 func isSuccess(outcome string) bool {
@@ -391,6 +611,9 @@ func writeAtomic(path string, value any) error {
 		return &CommitError{Err: err}
 	}
 	b = append(b, '\n')
+	if len(b) > MaxDocumentBytes {
+		return &CommitError{Err: fmt.Errorf("%w: document exceeds %d bytes", ErrStorageLimit, MaxDocumentBytes)}
+	}
 	name := filepath.Base(path) + ".tmp-" + randomSuffix()
 	tmp := filepath.Join(filepath.Dir(path), name)
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)

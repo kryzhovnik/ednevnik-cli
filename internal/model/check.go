@@ -21,6 +21,7 @@ const (
 	ReasonCancelled              = "cancelled"
 	ReasonIO                     = "io"
 	ReasonInvalidArgument        = "invalid_argument"
+	ReasonStorageLimit           = "storage_limit"
 )
 
 type CheckResult struct {
