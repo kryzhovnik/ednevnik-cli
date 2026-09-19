@@ -23,7 +23,8 @@ Supported release targets:
 
 Download a binary and `SHA256SUMS` from
 [GitHub Releases](https://github.com/kryzhovnik/ednevnik-cli/releases), verify
-the checksum, and install the binary as `ednevnik` on your `PATH`.
+the checksum, make the binary executable with `chmod +x`, and install it as
+`ednevnik` on your `PATH`.
 
 To build from source:
 
