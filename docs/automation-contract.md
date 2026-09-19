@@ -63,8 +63,8 @@ retrying starts a new check and cannot make the cancelled attempt successful.
 The live adapter validates grade overview, current absences, and bounded
 timeline pages through the real parsers. A valid empty grade overview has a
 complete observed grade-table container. A valid empty absence page has either
-the complete legacy categories container or the scoped no-data structure with
-the expected absence modal target. Truncated, misplaced, or partially matching
+the complete legacy categories container or the required scoped
+statistics/no-data/modal structure. Truncated, misplaced, or partially matching
 empty markers are invalid. When the page supplies a student-class identifier,
 it must match the requested enrolment; an otherwise recognized empty page can
 have no such identifier. An arbitrary HTML page is not an empty section.
