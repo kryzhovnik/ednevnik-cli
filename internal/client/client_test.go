@@ -11,13 +11,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/coordination"
+	"github.com/kryzhovnik/ednevnik-cli/internal/coordination"
 )
 
 func TestReadResponseBodyRejectsOversizeWithoutReturningPrefix(t *testing.T) {
 	body, err := readResponseBody(bytes.NewReader(make([]byte, maxResponseBytes+1)))
 	if !errors.Is(err, ErrResponseTooLarge) || body != nil {
 		t.Fatalf("body length=%d err=%v", len(body), err)
+	}
+}
+
+func TestSetUserAgentVersion(t *testing.T) {
+	c := &Client{userAgent: defaultUserAgent}
+	c.SetUserAgentVersion("0.1.0-beta.2")
+	want := "ednevnik-cli/0.1.0-beta.2 (+https://github.com/kryzhovnik/ednevnik-cli)"
+	if c.userAgent != want {
+		t.Fatalf("user agent=%q, want %q", c.userAgent, want)
 	}
 }
 

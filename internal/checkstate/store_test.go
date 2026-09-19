@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
 )
 
 func result(profile model.CheckProfile, id, outcome string, requested ...string) model.CheckResult {

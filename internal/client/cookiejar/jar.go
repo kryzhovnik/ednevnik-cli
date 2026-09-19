@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/client/cookiejar/internal/ascii"
+	"github.com/kryzhovnik/ednevnik-cli/internal/client/cookiejar/internal/ascii"
 )
 
 // PublicSuffixList provides the public suffix of a domain. For example:

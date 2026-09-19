@@ -12,11 +12,13 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	jarengine "github.com/kryzhovnik/ednevnik/internal/client/cookiejar"
-	"github.com/kryzhovnik/ednevnik/internal/coordination"
+	jarengine "github.com/kryzhovnik/ednevnik-cli/internal/client/cookiejar"
+	"github.com/kryzhovnik/ednevnik-cli/internal/coordination"
 )
 
 const DefaultBaseURL = "https://moj.esdnevnik.rs"
+
+const defaultUserAgent = "ednevnik-cli/0.1 (+https://github.com/kryzhovnik/ednevnik-cli)"
 
 var (
 	ErrNotAuthenticated        = errors.New("not authenticated; run `ednevnik login`")
@@ -82,10 +84,17 @@ func newClientWithMode(baseURL, sessionPath, account string, lease *coordination
 		http:  &http.Client{Jar: jar, Timeout: 30 * time.Second, Transport: transport},
 		lease: lease, sessionPath: sessionPath,
 		account:   account,
-		userAgent: "ednevnik-cli/0.1 (+https://github.com/kryzhovnik/ednevnik)",
+		userAgent: defaultUserAgent,
 	}
 	c.http.CheckRedirect = c.checkRedirect
 	return c, nil
+}
+
+// SetUserAgentVersion identifies the exact CLI build to the portal.
+func (c *Client) SetUserAgentVersion(version string) {
+	if version != "" {
+		c.userAgent = fmt.Sprintf("ednevnik-cli/%s (+https://github.com/kryzhovnik/ednevnik-cli)", version)
+	}
 }
 
 func isLoopbackHost(host string) bool {

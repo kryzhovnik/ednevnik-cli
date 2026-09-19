@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
 )
 
 func snapshots(before, after model.StudentData) (model.Snapshot, model.Snapshot) {

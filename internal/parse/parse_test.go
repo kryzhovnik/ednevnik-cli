@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kryzhovnik/ednevnik/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
 )
 
 func TestStudents(t *testing.T) {

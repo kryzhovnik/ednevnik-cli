@@ -15,7 +15,7 @@ import (
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/kryzhovnik/ednevnik/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
 	xhtml "golang.org/x/net/html"
 )
 

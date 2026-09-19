@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/checkstate"
-	"github.com/kryzhovnik/ednevnik/internal/model"
-	"github.com/kryzhovnik/ednevnik/internal/parse"
+	"github.com/kryzhovnik/ednevnik-cli/internal/checkstate"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/parse"
 )
 
 type timelineScriptClient struct {

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	jarengine "github.com/kryzhovnik/ednevnik/internal/client/cookiejar"
-	"github.com/kryzhovnik/ednevnik/internal/store"
+	jarengine "github.com/kryzhovnik/ednevnik-cli/internal/client/cookiejar"
+	"github.com/kryzhovnik/ednevnik-cli/internal/store"
 )
 
 func mustURL(t *testing.T, raw string) *url.URL {

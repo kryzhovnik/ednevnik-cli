@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
 )
 
 type ReconcileOptions struct {

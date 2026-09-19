@@ -16,7 +16,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kryzhovnik/ednevnik/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
 )
 
 const SchemaVersion = 3

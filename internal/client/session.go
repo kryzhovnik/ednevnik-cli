@@ -11,8 +11,8 @@ import (
 	"os"
 	"strings"
 
-	jarengine "github.com/kryzhovnik/ednevnik/internal/client/cookiejar"
-	"github.com/kryzhovnik/ednevnik/internal/store"
+	jarengine "github.com/kryzhovnik/ednevnik-cli/internal/client/cookiejar"
+	"github.com/kryzhovnik/ednevnik-cli/internal/store"
 	"golang.org/x/net/publicsuffix"
 )
 

@@ -18,13 +18,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/checkstate"
-	"github.com/kryzhovnik/ednevnik/internal/client"
-	"github.com/kryzhovnik/ednevnik/internal/coordination"
-	"github.com/kryzhovnik/ednevnik/internal/credentials"
-	"github.com/kryzhovnik/ednevnik/internal/model"
-	"github.com/kryzhovnik/ednevnik/internal/parse"
-	"github.com/kryzhovnik/ednevnik/internal/store"
+	"github.com/kryzhovnik/ednevnik-cli/internal/checkstate"
+	"github.com/kryzhovnik/ednevnik-cli/internal/client"
+	"github.com/kryzhovnik/ednevnik-cli/internal/coordination"
+	"github.com/kryzhovnik/ednevnik-cli/internal/credentials"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/parse"
+	"github.com/kryzhovnik/ednevnik-cli/internal/store"
 )
 
 type fakeClient struct {

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/kryzhovnik/ednevnik/internal/client/cookiejar/internal/ascii"
+	"github.com/kryzhovnik/ednevnik-cli/internal/client/cookiejar/internal/ascii"
 )
 
 // These parameter values are specified in section 5.

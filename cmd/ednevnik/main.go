@@ -19,13 +19,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kryzhovnik/ednevnik/internal/checkstate"
-	"github.com/kryzhovnik/ednevnik/internal/client"
-	"github.com/kryzhovnik/ednevnik/internal/coordination"
-	"github.com/kryzhovnik/ednevnik/internal/credentials"
-	"github.com/kryzhovnik/ednevnik/internal/model"
-	"github.com/kryzhovnik/ednevnik/internal/parse"
-	"github.com/kryzhovnik/ednevnik/internal/store"
+	"github.com/kryzhovnik/ednevnik-cli/internal/checkstate"
+	"github.com/kryzhovnik/ednevnik-cli/internal/client"
+	"github.com/kryzhovnik/ednevnik-cli/internal/coordination"
+	"github.com/kryzhovnik/ednevnik-cli/internal/credentials"
+	"github.com/kryzhovnik/ednevnik-cli/internal/model"
+	"github.com/kryzhovnik/ednevnik-cli/internal/parse"
+	"github.com/kryzhovnik/ednevnik-cli/internal/store"
 	"golang.org/x/term"
 )
 
@@ -243,6 +243,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	c.SetUserAgentVersion(version)
 	a := &app{client: c, dir: stateDir, origin: origin, profile: profile, configDir: dir, lease: lease, legacyDir: filepath.Join(coordinator.StateDir(), "schema-v2"), accountDir: coordinator.StateDir()}
 	providerName := os.Getenv("EDNEVNIK_CREDENTIAL_PROVIDER")
 	if providerName != "" && args[0] != "login" {
