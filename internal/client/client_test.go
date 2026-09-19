@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/kryzhovnik/ednevnik-cli/internal/coordination"
 )
@@ -153,7 +152,7 @@ func TestGetReportsExpiredSession(t *testing.T) {
 	}
 }
 
-func TestRedirectsAndRetriesEachConsumeBudget(t *testing.T) {
+func TestEachTransportAttemptIsCounted(t *testing.T) {
 	t.Run("redirect", func(t *testing.T) {
 		var requests int
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -178,7 +177,7 @@ func TestRedirectsAndRetriesEachConsumeBudget(t *testing.T) {
 			t.Fatalf("requests=%d count=%d err=%v", requests, count, err)
 		}
 	})
-	t.Run("eligible read retries", func(t *testing.T) {
+	t.Run("server errors are not retried", func(t *testing.T) {
 		var requests int
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requests++
@@ -190,11 +189,9 @@ func TestRedirectsAndRetriesEachConsumeBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_, _ = c.Get(ctx, "/read")
+		_, _ = c.Get(context.Background(), "/read")
 		count, _, _, err := lease.Status()
-		if err != nil || requests != 3 || count != 3 {
+		if err != nil || requests != 1 || count != 1 {
 			t.Fatalf("requests=%d count=%d err=%v", requests, count, err)
 		}
 	})

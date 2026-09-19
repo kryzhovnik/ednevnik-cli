@@ -196,7 +196,7 @@ func TestLiveRetryAfterInterruptedOutputDoesNotDuplicateTransition(t *testing.T)
 	_ = r.Close()
 	old := os.Stdout
 	os.Stdout = w
-	err = a.check(context.Background(), []string{"--force", "--profile=family", "--student=1234567"})
+	err = a.check(context.Background(), []string{"--profile=family", "--student=1234567"})
 	os.Stdout = old
 	_ = w.Close()
 	var interrupted *commandError
@@ -204,7 +204,7 @@ func TestLiveRetryAfterInterruptedOutputDoesNotDuplicateTransition(t *testing.T)
 		t.Fatalf("error=%#v", err)
 	}
 	if _, err := captureStdout(t, func() error {
-		return a.check(context.Background(), []string{"--force", "--profile=family", "--student=1234567"})
+		return a.check(context.Background(), []string{"--profile=family", "--student=1234567"})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +467,7 @@ func TestRealCLIFailedAuthCheckThenProviderRecovery(t *testing.T) {
 	}))
 	defer portal.Close()
 	root := t.TempDir()
-	common := append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+root, "EDNEVNIK_TEST_STATE_DIR="+root, "EDNEVNIK_BASE_URL="+portal.URL, "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_MIN_CHECK_INTERVAL=0s")
+	common := append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT="+root, "EDNEVNIK_TEST_STATE_DIR="+root, "EDNEVNIK_BASE_URL="+portal.URL, "EDNEVNIK_REQUEST_INTERVAL=0s")
 	first := exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
 	first.Env = common
 	if err := first.Run(); err == nil {
@@ -608,7 +608,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	concurrentErrs := make(chan error, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			c := exec.Command(binary, "check", "--force", "--profile=family", "--student", "1234567")
+			c := exec.Command(binary, "check", "--profile=family", "--student", "1234567")
 			c.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+configDir, "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 			concurrentErrs <- c.Run()
 		}()
@@ -645,7 +645,7 @@ func TestProcessLiveIncompleteAndLocalRecoveryCommands(t *testing.T) {
 	retainedSuccessID := beforeFailures.LastSuccess.CheckID
 	for _, mode := range []string{"maintenance", "success-only", "oversized"} {
 		portalMode.Store(mode)
-		cmd = exec.Command(binary, "check", "--force", "--profile", "family", "--student", "1234567")
+		cmd = exec.Command(binary, "check", "--profile", "family", "--student", "1234567")
 		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+t.TempDir(), "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 		stdout.Reset()
 		stderr.Reset()
@@ -750,12 +750,9 @@ func TestProcessSuccessiveAbsenceCorrectionsRetainDistinctTransitions(t *testing
 	defer portal.Close()
 	stateDir := t.TempDir()
 	testRoot := t.TempDir()
-	run := func(force bool) checkResult {
+	run := func() checkResult {
 		t.Helper()
 		args := []string{"check", "--profile=family", "--student=1234567"}
-		if force {
-			args = append(args, "--force")
-		}
 		cmd := exec.Command(binary, args...)
 		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 		var stdout, stderr bytes.Buffer
@@ -769,19 +766,19 @@ func TestProcessSuccessiveAbsenceCorrectionsRetainDistinctTransitions(t *testing
 		}
 		return result
 	}
-	if got := run(false); got.Outcome != model.OutcomeInitialBaseline {
+	if got := run(); got.Outcome != model.OutcomeInitialBaseline {
 		t.Fatalf("initial=%#v", got)
 	}
 	status.Store("red")
-	if got := run(true); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_added" {
+	if got := run(); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_added" {
 		t.Fatalf("addition=%#v", got)
 	}
 	status.Store("green")
-	if got := run(true); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_updated" {
+	if got := run(); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_updated" {
 		t.Fatalf("first correction=%#v", got)
 	}
 	status.Store("red")
-	if got := run(true); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_updated" {
+	if got := run(); got.Outcome != model.OutcomeCompleteWithChanges || got.Changes.Items[0].Kind != "absence_updated" {
 		t.Fatalf("second correction=%#v", got)
 	}
 
@@ -801,15 +798,15 @@ func TestProcessSuccessiveAbsenceCorrectionsRetainDistinctTransitions(t *testing
 	}
 	occurrenceKey := document.Events[0].Change.RecordKey
 	status.Store("double")
-	if got := run(true); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
+	if got := run(); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
 		t.Fatalf("insertion ambiguity=%#v", got)
 	}
 	status.Store("single_b")
-	if got := run(true); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
+	if got := run(); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
 		t.Fatalf("contraction ambiguity=%#v", got)
 	}
 	status.Store("single_b_corrected")
-	if got := run(true); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
+	if got := run(); got.Changes.Count != 1 || !got.Changes.Items[0].Ambiguous {
 		t.Fatalf("continued ambiguity=%#v", got)
 	}
 	if err := store.LoadSnapshot(filepath.Join(coord.StateDir(), "check-state.json"), &document); err != nil {
@@ -845,12 +842,9 @@ func TestProcessStableAbsenceReappearanceContinuesIdentity(t *testing.T) {
 	}))
 	defer portal.Close()
 	stateDir, testRoot := t.TempDir(), t.TempDir()
-	run := func(force bool) checkResult {
+	run := func() checkResult {
 		t.Helper()
 		args := []string{"check", "--profile=stable", "--student=1234567"}
-		if force {
-			args = append(args, "--force")
-		}
 		cmd := exec.Command(binary, args...)
 		cmd.Env = append(os.Environ(), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_TEST_STATE_ROOT="+testRoot, "EDNEVNIK_TEST_STATE_DIR="+stateDir, "EDNEVNIK_BASE_URL="+portal.URL)
 		var stdout, stderr bytes.Buffer
@@ -864,21 +858,21 @@ func TestProcessStableAbsenceReappearanceContinuesIdentity(t *testing.T) {
 		}
 		return got
 	}
-	if got := run(false); got.Outcome != model.OutcomeInitialBaseline {
+	if got := run(); got.Outcome != model.OutcomeInitialBaseline {
 		t.Fatalf("initial=%#v", got)
 	}
 	mode.Store("green")
-	updated := run(true)
+	updated := run()
 	if updated.Changes.Count != 1 || updated.Changes.Items[0].Kind != "absence_updated" {
 		t.Fatalf("updated=%#v", updated)
 	}
 	stableKey := updated.Changes.Items[0].RecordKey
 	mode.Store("missing")
-	if got := run(true); got.Outcome != model.OutcomeCompleteWithoutChanges {
+	if got := run(); got.Outcome != model.OutcomeCompleteWithoutChanges {
 		t.Fatalf("missing=%#v", got)
 	}
 	mode.Store("green")
-	reappeared := run(true)
+	reappeared := run()
 	if reappeared.Changes.Count != 1 || reappeared.Changes.Items[0].Kind != "absence_reappeared" || reappeared.Changes.Items[0].Meaning != "observed_reappearance" || reappeared.Changes.Items[0].RecordKey != stableKey {
 		t.Fatalf("reappeared=%#v", reappeared)
 	}
@@ -1310,7 +1304,7 @@ func TestConsumerReplayRacesActualCLIChecksWithoutPortalReads(t *testing.T) {
 		t.Fatal("consumer registration contacted portal")
 	}
 	stage.Store(1)
-	mustCommand("check", "--force", "--profile=family", "--student=1234567")
+	mustCommand("check", "--profile=family", "--student=1234567")
 	first := decode(mustCommand("consumer-read", "--profile=family", "--consumer=notify", "--limit=1"))
 	auditFirst := decode(mustCommand("consumer-read", "--profile=family", "--consumer=audit", "--limit=1"))
 	if len(first.Events) != 1 || len(auditFirst.Events) != 1 {
@@ -1337,7 +1331,7 @@ func TestConsumerReplayRacesActualCLIChecksWithoutPortalReads(t *testing.T) {
 		err error
 	}, 1)
 	go func() {
-		_, err := command("check", "--force", "--profile=family", "--student=1234567")
+		_, err := command("check", "--profile=family", "--student=1234567")
 		checkDone <- err
 	}()
 	go func() {
@@ -1365,7 +1359,7 @@ func TestConsumerReplayRacesActualCLIChecksWithoutPortalReads(t *testing.T) {
 	checkDone = make(chan error, 1)
 	ackDone := make(chan error, 1)
 	go func() {
-		_, err := command("check", "--force", "--profile=family", "--student=1234567")
+		_, err := command("check", "--profile=family", "--student=1234567")
 		checkDone <- err
 	}()
 	go func() {
@@ -1416,22 +1410,6 @@ func TestNamespacedLegacyStateRefusesUnboundFiles(t *testing.T) {
 	}
 }
 
-func TestCheckRefusesFutureAttemptTimestamp(t *testing.T) {
-	dir := t.TempDir()
-	profile := checkProfile{ID: "family", Origin: "https://portal.example"}
-	future := time.Now().UTC().Add(time.Hour)
-	prior := checkResult{SchemaVersion: checkSchemaVersion, CheckID: "future", Outcome: model.OutcomeFailed, Profile: profile, Requested: []string{"1234567"}, Coverage: []enrolmentCoverage{}, StartedAt: future, CompletedAt: future, Baseline: baselineReference{NewEnrolments: []string{}}, Changes: changeSummary{Items: []model.Change{}}, Guidance: guidance{}, Failure: &model.FailureSummary{Reason: model.ReasonIO}}
-	if _, err := (&app{dir: dir}).checkStateStore("family").Commit(profile, prior, nil); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{dir: dir, origin: profile.Origin, checker: scriptedCheckRunner{}}
-	err := a.check(context.Background(), []string{"--profile=family", "--student", "1234567"})
-	var ce *commandError
-	if !errors.As(err, &ce) || ce.body.Reason != model.ReasonRefusalQuota {
-		t.Fatalf("error=%#v", err)
-	}
-}
-
 func TestSyncWritesSnapshotAndChanges(t *testing.T) {
 	fake := &fakeClient{}
 	a := &app{client: fake, dir: t.TempDir()}
@@ -1446,7 +1424,7 @@ func TestSyncWritesSnapshotAndChanges(t *testing.T) {
 		t.Fatalf("snapshot=%#v", first)
 	}
 	fake.second = true
-	if err := a.sync(context.Background(), []string{"--force", "--student", "1234567"}); err != nil {
+	if err := a.sync(context.Background(), []string{"--student", "1234567"}); err != nil {
 		t.Fatal(err)
 	}
 	var changes model.Changes
@@ -1468,7 +1446,7 @@ func TestSyncWritesSnapshotAndChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.invalid = true
-	if err := a.sync(context.Background(), []string{"--force", "--student", "1234567"}); !errors.Is(err, parse.ErrInvalidSource) {
+	if err := a.sync(context.Background(), []string{"--student", "1234567"}); !errors.Is(err, parse.ErrInvalidSource) {
 		t.Fatalf("invalid sync err=%v", err)
 	}
 	after, err := os.ReadFile(latest)
@@ -1530,7 +1508,7 @@ func TestSyncCurrentRejectsMissingExpectedAndNoCurrentEnrolments(t *testing.T) {
 	}
 	home := []byte(`<div class="card student"><div class="card-header"><h5>Child</h5></div><a class="student-school-class-wrap" href="/?student=1111111"><div class="student-school-class-item">School</div><div class="student-school-class-item school-class-strong">V a</div><div class="student-school-class-item">26/27</div></a></div>`)
 	a := &app{client: &discoveryClient{home: home}, dir: dir}
-	if err := a.sync(context.Background(), []string{"--current", "--force"}); err == nil || !strings.Contains(err.Error(), "2222222") {
+	if err := a.sync(context.Background(), []string{"--current"}); err == nil || !strings.Contains(err.Error(), "2222222") {
 		t.Fatalf("missing expected enrolment err=%v", err)
 	}
 	var preserved model.Snapshot
@@ -1540,7 +1518,7 @@ func TestSyncCurrentRejectsMissingExpectedAndNoCurrentEnrolments(t *testing.T) {
 
 	withdrawn := []byte(`<div class="card student"><div class="card-header"><h5>Child</h5></div><a class="student-school-class-wrap" href="/?student=1111111"><div class="student-school-class-item">School</div><div class="student-school-class-item school-class-strong">Исписан</div><div class="student-school-class-item">26/27</div></a></div>`)
 	a = &app{client: &discoveryClient{home: withdrawn}, dir: t.TempDir()}
-	if err := a.sync(context.Background(), []string{"--current", "--force"}); err == nil || !strings.Contains(err.Error(), "no_current_enrolments") {
+	if err := a.sync(context.Background(), []string{"--current"}); err == nil || !strings.Contains(err.Error(), "no_current_enrolments") {
 		t.Fatalf("no-current err=%v", err)
 	}
 }

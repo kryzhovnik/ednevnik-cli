@@ -251,12 +251,9 @@ func TestCandidateHeadlessAuthCheckConsumerReplay(t *testing.T) {
 
 func TestCandidateDefaultRequestPacing(t *testing.T) {
 	binary := buildCandidateBinary(t)
-	var mu sync.Mutex
-	requestTimes := []time.Time{}
+	var requests atomic.Int32
 	portal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		requestTimes = append(requestTimes, time.Now())
-		mu.Unlock()
+		requests.Add(1)
 		switch r.URL.Path {
 		case "/grades":
 			_, _ = io.WriteString(w, `<div class="flex-table"></div>`)
@@ -276,16 +273,16 @@ func TestCandidateDefaultRequestPacing(t *testing.T) {
 			break
 		}
 	}
+	started := time.Now()
 	out, stderr, code := runCandidateCommand(t, binary, env, "check", "--profile=family", "--student=1234567")
+	elapsed := time.Since(started)
 	if code != 0 {
 		t.Fatalf("default-paced check exit=%d stdout=%s stderr=%s", code, out, stderr)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(requestTimes) != 3 {
-		t.Fatalf("requests=%d want=3", len(requestTimes))
+	if requests.Load() != 3 {
+		t.Fatalf("requests=%d want=3", requests.Load())
 	}
-	if elapsed := requestTimes[2].Sub(requestTimes[0]); elapsed < 4900*time.Millisecond {
+	if elapsed < 4900*time.Millisecond {
 		t.Fatalf("default request pacing too short: %s", elapsed)
 	}
 }
@@ -304,7 +301,7 @@ func candidateEnv(root, portalURL string) []string {
 	tmp := filepath.Join(root, "tmp")
 	_ = os.MkdirAll(home, 0o700)
 	_ = os.MkdirAll(tmp, 0o700)
-	return []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "TMPDIR=" + tmp, "XDG_CONFIG_HOME=" + filepath.Join(home, ".config"), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT=" + root, "EDNEVNIK_TEST_STATE_DIR=" + root, "EDNEVNIK_BASE_URL=" + portalURL, "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_MIN_CHECK_INTERVAL=0s", "EDNEVNIK_COMMAND_TIMEOUT=10s", "EDNEVNIK_USERNAME=", "EDNEVNIK_PASSWORD=", "EDNEVNIK_CREDENTIALS_FILE="}
+	return []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "TMPDIR=" + tmp, "XDG_CONFIG_HOME=" + filepath.Join(home, ".config"), "EDNEVNIK_TEST_ALLOW_HTTP_LOOPBACK=1", "EDNEVNIK_TEST_STATE_ROOT=" + root, "EDNEVNIK_TEST_STATE_DIR=" + root, "EDNEVNIK_BASE_URL=" + portalURL, "EDNEVNIK_REQUEST_INTERVAL=0s", "EDNEVNIK_COMMAND_TIMEOUT=10s", "EDNEVNIK_USERNAME=", "EDNEVNIK_PASSWORD=", "EDNEVNIK_CREDENTIALS_FILE="}
 }
 
 func runCandidateCommand(t *testing.T, binary string, env []string, args ...string) (stdout, stderr []byte, exitCode int) {

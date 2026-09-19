@@ -80,7 +80,6 @@ func (a *app) check(ctx context.Context, args []string) error {
 	profile := fs.String("profile", "", "configured account/profile namespace")
 	var enrolments stringList
 	fs.Var(&enrolments, "student", "enrolment ID; repeat for several enrolments")
-	force := fs.Bool("force", false, "bypass only the local minimum check interval")
 	if err := fs.Parse(args); err != nil {
 		return newContractError("", "invalid_argument", err, false, "Fix the command arguments and retry.", 2)
 	}
@@ -105,21 +104,6 @@ func (a *app) check(ctx context.Context, args []string) error {
 		}
 	}
 	sort.Strings(selected)
-	minimum, err := configuredMinimumCheckInterval()
-	if err != nil {
-		return newContractError("", model.ReasonInvalidArgument, err, false, "Correct EDNEVNIK_MIN_CHECK_INTERVAL.", 2)
-	}
-	if !*force {
-		priorState, statusErr := a.checkStateStore(*profile).Load(checkProfile{ID: *profile, Origin: a.origin})
-		if statusErr == nil && priorState.LatestAttempt != nil && !priorState.LatestAttempt.CompletedAt.IsZero() {
-			elapsed := time.Since(priorState.LatestAttempt.CompletedAt)
-			if elapsed < minimum {
-				return newContractError("", model.ReasonRefusalQuota, fmt.Errorf("minimum check interval is %s; retry in %s", minimum, (minimum-elapsed).Round(time.Second)), true, "Wait for the local interval or use --force; force still respects request budgets and server cooldowns.", 1)
-			}
-		} else if statusErr != nil && !errors.Is(statusErr, checkstate.ErrAbsent) {
-			return newContractError("", model.ReasonInvalidState, statusErr, false, "Preserve the state. Archive legacy schema-v2 files before establishing a schema-v3 baseline, or repair the named schema-v3 state file.", 1)
-		}
-	}
 	now := time.Now().UTC()
 	checkID, err := newCheckID()
 	if err != nil {
@@ -536,7 +520,11 @@ func liveReadFailure(err error) error {
 	if errors.As(err, &httpErr) {
 		if httpErr.StatusCode == 429 || httpErr.StatusCode == 503 {
 			retryAt := time.Now().UTC().Add(httpErr.RetryAfter)
-			return &checkFailure{Reason: model.ReasonRefusalQuota, Err: err, Retryable: true, RetryAfter: &retryAt, Action: "Respect the persisted server cooldown before retrying."}
+			failure := &checkFailure{Reason: model.ReasonRefusalQuota, Err: err, Retryable: true, Action: "Respect Retry-After when the server supplies it."}
+			if httpErr.RetryAfter > 0 {
+				failure.RetryAfter = &retryAt
+			}
+			return failure
 		}
 		if httpErr.StatusCode == 401 || httpErr.StatusCode == 403 {
 			return &checkFailure{Reason: model.ReasonAuthenticationProvider, Err: err, Action: "Authenticate the selected account once; do not retry the rejected credentials automatically."}
@@ -545,7 +533,7 @@ func liveReadFailure(err error) error {
 	var refusal *coordination.Refusal
 	if errors.As(err, &refusal) {
 		retryAt := refusal.RetryAt
-		return &checkFailure{Reason: model.ReasonRefusalQuota, Err: err, Retryable: true, RetryAfter: &retryAt, Action: "Wait until the reported retry time; force does not bypass request budgets or server cooldowns."}
+		return &checkFailure{Reason: model.ReasonRefusalQuota, Err: err, Retryable: true, RetryAfter: &retryAt, Action: "Wait until the reported retry time."}
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return &checkFailure{Reason: model.ReasonCancelled, Err: err, Retryable: true, Action: "Retry as a new check after the cancellation or deadline condition is resolved."}

@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	DefaultDailyBudget = 192
+	DefaultDailyBudget = 200
 	DefaultRequestPace = 2500 * time.Millisecond
 	DefaultLockWait    = 30 * time.Second
 )
@@ -45,7 +45,7 @@ func DefaultConfig() Config {
 func ConfigFromEnv() (Config, error) {
 	c := DefaultConfig()
 	var err error
-	if c.DailyBudget, err = positiveIntEnv("EDNEVNIK_DAILY_REQUEST_LIMIT", c.DailyBudget); err != nil {
+	if c.DailyBudget, err = nonnegativeIntEnv("EDNEVNIK_DAILY_REQUEST_LIMIT", c.DailyBudget); err != nil {
 		return Config{}, err
 	}
 	if c.RequestPace, err = nonnegativeDurationEnv("EDNEVNIK_REQUEST_INTERVAL", c.RequestPace); err != nil {
@@ -78,7 +78,7 @@ func New(root string, namespace Namespace, config Config) (*Coordinator, error) 
 	if root == "" || namespace.Profile == "" || namespace.Origin == "" {
 		return nil, errors.New("coordination requires state root, profile, and origin")
 	}
-	if config.DailyBudget < 1 || config.RequestPace < 0 || config.LockWait <= 0 {
+	if config.DailyBudget < 0 || config.RequestPace < 0 || config.LockWait <= 0 {
 		return nil, errors.New("invalid coordination configuration")
 	}
 	if config.Now == nil {
@@ -184,7 +184,7 @@ func (l *Lease) BeforeRequest(ctx context.Context) error {
 	if state.CooldownUntil.After(now) {
 		return &Refusal{Cause: ErrServerCooldown, RetryAt: state.CooldownUntil}
 	}
-	if state.Count >= l.config.DailyBudget {
+	if l.config.DailyBudget > 0 && state.Count >= l.config.DailyBudget {
 		return &Refusal{Cause: ErrBudgetExhausted, RetryAt: state.WindowStart.Add(24 * time.Hour)}
 	}
 	until := state.LastRequest.Add(l.config.RequestPace)
@@ -218,6 +218,9 @@ func (l *Lease) RecordResponse(resp *http.Response) error {
 	}
 	now := l.config.Now().UTC()
 	until := parseRetryAfter(resp.Header.Get("Retry-After"), now)
+	if until.IsZero() {
+		return nil
+	}
 	if until.After(state.CooldownUntil) {
 		state.CooldownUntil = until
 	}
@@ -233,7 +236,7 @@ func (l *Lease) Status() (count, limit int, retryAt time.Time, err error) {
 		return 0, l.config.DailyBudget, time.Time{}, err
 	}
 	state = rollWindow(state, l.config.Now().UTC())
-	if state.Count >= l.config.DailyBudget {
+	if l.config.DailyBudget > 0 && state.Count >= l.config.DailyBudget {
 		retryAt = state.WindowStart.Add(24 * time.Hour)
 	}
 	if state.CooldownUntil.After(retryAt) {
@@ -330,17 +333,17 @@ func parseRetryAfter(raw string, now time.Time) time.Time {
 	if when, err := http.ParseTime(raw); err == nil && when.After(now) {
 		return when
 	}
-	return now.Add(6 * time.Hour)
+	return time.Time{}
 }
 
-func positiveIntEnv(name string, fallback int) (int, error) {
+func nonnegativeIntEnv(name string, fallback int) (int, error) {
 	raw := os.Getenv(name)
 	if raw == "" {
 		return fallback, nil
 	}
 	v, e := strconv.Atoi(raw)
-	if e != nil || v < 1 {
-		return 0, fmt.Errorf("%s must be a positive integer", name)
+	if e != nil || v < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
 	}
 	return v, nil
 }

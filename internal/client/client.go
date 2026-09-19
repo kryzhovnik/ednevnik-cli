@@ -191,48 +191,32 @@ func (c *Client) get(ctx context.Context, path string, authenticated bool) ([]by
 	if err != nil {
 		return nil, nil, err
 	}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			delays := []time.Duration{5 * time.Second, 20 * time.Second}
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(delays[attempt-1]):
-			}
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-		if err != nil {
-			return nil, nil, err
-		}
-		resp, err := c.do(req)
-		if err != nil {
-			return nil, nil, err
-		}
-		body, readErr := readResponseBody(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return nil, nil, readErr
-		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			return nil, resp.Request.URL, &HTTPError{StatusCode: resp.StatusCode, RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
-		}
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return nil, resp.Request.URL, &HTTPError{StatusCode: resp.StatusCode}
-		}
-		if resp.StatusCode >= 500 {
-			lastErr = &HTTPError{StatusCode: resp.StatusCode}
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-			return nil, resp.Request.URL, &HTTPError{StatusCode: resp.StatusCode}
-		}
-		if authenticated && resp.Request.URL.Path == "/login" {
-			return nil, resp.Request.URL, ErrNotAuthenticated
-		}
-		return body, resp.Request.URL, nil
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return nil, nil, err
 	}
-	return nil, nil, lastErr
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, readErr := readResponseBody(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, nil, readErr
+	}
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, resp.Request.URL, &HTTPError{StatusCode: resp.StatusCode, RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, resp.Request.URL, &HTTPError{StatusCode: resp.StatusCode}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return nil, resp.Request.URL, &HTTPError{StatusCode: resp.StatusCode}
+	}
+	if authenticated && resp.Request.URL.Path == "/login" {
+		return nil, resp.Request.URL, ErrNotAuthenticated
+	}
+	return body, resp.Request.URL, nil
 }
 
 func (c *Client) resolveTarget(raw string) (*url.URL, error) {
@@ -319,5 +303,5 @@ func retryAfter(raw string) time.Duration {
 	if when, err := http.ParseTime(raw); err == nil && when.After(time.Now()) {
 		return time.Until(when)
 	}
-	return 6 * time.Hour
+	return 0
 }

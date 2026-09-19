@@ -120,7 +120,7 @@ func joinJSON(items []string) string {
 func runCheckResult(t *testing.T, a *app) (checkResult, error) {
 	t.Helper()
 	data, err := captureStdout(t, func() error {
-		return a.check(context.Background(), []string{"--force", "--profile=family", "--student=1234567"})
+		return a.check(context.Background(), []string{"--profile=family", "--student=1234567"})
 	})
 	var result checkResult
 	if unmarshalErr := json.Unmarshal(data, &result); unmarshalErr != nil {
@@ -406,7 +406,7 @@ func TestProcessCheckCatchesUpPaginatedTimelineAndCommitsState(t *testing.T) {
 		t.Fatalf("initial=%#v", initial)
 	}
 	catchUp.Store(true)
-	result := run("check", "--force", "--profile=family", "--student=1234567")
+	result := run("check", "--profile=family", "--student=1234567")
 	if result.Outcome != model.OutcomeCompleteWithChanges || result.Changes.Count != 3 || result.Coverage[0].Continuity.Reason != "timeline_overlap_established" {
 		t.Fatalf("result=%#v", result)
 	}

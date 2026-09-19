@@ -90,7 +90,7 @@ func main() {
 func classifyOperationalError(err error) *commandError {
 	var refusal *coordination.Refusal
 	if errors.As(err, &refusal) {
-		result := newContractError("", model.ReasonRefusalQuota, err, true, "Wait until the reported retry time; force does not bypass request budgets or server cooldowns.", 1)
+		result := newContractError("", model.ReasonRefusalQuota, err, true, "Wait until the reported retry time.", 1)
 		result.body.Guidance.RetryAfter = &refusal.RetryAt
 		return result
 	}
@@ -119,8 +119,10 @@ func classifyOperationalError(err error) *commandError {
 	if errors.As(err, &httpErr) {
 		if httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode == http.StatusServiceUnavailable {
 			retryAt := time.Now().UTC().Add(httpErr.RetryAfter)
-			result := newContractError("", model.ReasonRefusalQuota, err, true, "Respect the persisted server cooldown before retrying.", 1)
-			result.body.Guidance.RetryAfter = &retryAt
+			result := newContractError("", model.ReasonRefusalQuota, err, true, "Respect Retry-After when the server supplies it.", 1)
+			if httpErr.RetryAfter > 0 {
+				result.body.Guidance.RetryAfter = &retryAt
+			}
 			return result
 		}
 		if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden {
@@ -655,7 +657,6 @@ func (a *app) sync(ctx context.Context, args []string) error {
 	fs.Var(&students, "student", "student enrolment ID; repeat for several students")
 	profile := fs.String("profile", "", "use the reliable schema-v3 check for this account/profile")
 	currentOnly := fs.Bool("current", false, "discover and sync every current enrolment")
-	force := fs.Bool("force", false, "bypass only the local minimum check interval")
 	consumer := fs.String("consumer", "", "independent snapshot and change stream name")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -665,9 +666,6 @@ func (a *app) sync(ctx context.Context, args []string) error {
 			return errors.New("sync --profile accepts explicit --student values only; --current and --consumer remain legacy schema-v2 options")
 		}
 		checkArgs := []string{"--profile", *profile}
-		if *force {
-			checkArgs = append(checkArgs, "--force")
-		}
 		for _, id := range students {
 			checkArgs = append(checkArgs, "--student", id)
 		}
@@ -719,13 +717,6 @@ func (a *app) sync(ctx context.Context, args []string) error {
 		if err := validateStudentID(id); err != nil {
 			return err
 		}
-	}
-	minimum, err := configuredMinimumCheckInterval()
-	if err != nil {
-		return err
-	}
-	if !*force && !previous.FetchedAt.IsZero() && time.Since(previous.FetchedAt) < minimum {
-		return fmt.Errorf("last sync was %s ago; wait %s or use --force deliberately", time.Since(previous.FetchedAt).Round(time.Second), minimum)
 	}
 	snapshot := model.Snapshot{SchemaVersion: model.SchemaVersion, FetchedAt: time.Now(), Students: []model.StudentData{}}
 	for _, studentID := range students {
@@ -1075,19 +1066,10 @@ func hasProfileFlag(args []string) bool {
 	return false
 }
 
-func configuredMinimumCheckInterval() (time.Duration, error) {
-	raw := envOr("EDNEVNIK_MIN_CHECK_INTERVAL", "30m")
-	d, err := time.ParseDuration(raw)
-	if err != nil || d < 0 {
-		return 0, errors.New("EDNEVNIK_MIN_CHECK_INTERVAL must be a non-negative duration")
-	}
-	return d, nil
-}
-
 func classifyCoordinationError(err error) error {
 	reason, retryable, action := model.ReasonConcurrency, true, "Retry after the other command finishes."
 	if errors.Is(err, coordination.ErrBudgetExhausted) || errors.Is(err, coordination.ErrServerCooldown) {
-		reason, action = model.ReasonRefusalQuota, "Wait until the reported retry time; force does not bypass request budgets or server cooldowns."
+		reason, action = model.ReasonRefusalQuota, "Wait until the reported retry time."
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		reason, retryable, action = model.ReasonCancelled, true, "Retry as a new command when the cancellation or deadline condition is resolved."

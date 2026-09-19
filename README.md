@@ -1,57 +1,56 @@
 # ednevnik-cli
 
-Unofficial read-only CLI for the Serbian parent portal at
-[`moj.esdnevnik.rs`](https://moj.esdnevnik.rs). It reads data available to an
-authenticated parent and emits versioned JSON for shell scripts and personal
-automation.
+Unofficial read-only CLI for the Serbian parent portal
+[`moj.esdnevnik.rs`](https://moj.esdnevnik.rs). It emits JSON for shell scripts
+and personal automation.
 
 This project is not affiliated with the Serbian Ministry of Education or the
 eDnevnik operators. Use it only with accounts and student data you are
-authorized to access.
-
-## Status
-
-Beta. The current build has been tested against the live portal with one
-account. Portal markup can vary between schools and can change without notice.
-
-Supported release targets:
-
-- macOS: Apple Silicon and Intel
-- Linux: arm64 and amd64
+authorized to access. Portal markup can change without notice.
 
 ## Install
 
 Download a binary and `SHA256SUMS` from
 [GitHub Releases](https://github.com/kryzhovnik/ednevnik-cli/releases), verify
-the checksum, make the binary executable with `chmod +x`, and install it as
-`ednevnik` on your `PATH`.
+the checksum, run `chmod +x` on the binary, and install it as `ednevnik` on
+your `PATH`.
 
 To build from source:
 
 ```sh
 go mod verify
 go build -trimpath -o ednevnik ./cmd/ednevnik
-./ednevnik version
 ```
-
-The required Go version is declared in [`go.mod`](go.mod).
 
 ## Authentication
 
-The recommended credential provider is a private JSON file. The CLI stores the
-authenticated session locally; it does not store the password.
+The recommended credential provider is a private JSON file:
+
+```json
+{
+  "schema_version": 1,
+  "account": "family",
+  "origin": "https://moj.esdnevnik.rs",
+  "username": "name@example.com",
+  "password": "..."
+}
+```
 
 ```sh
+chmod 600 /absolute/private/ednevnik-credentials.json
 export EDNEVNIK_PROFILE=family
 export EDNEVNIK_CREDENTIAL_PROVIDER=file
 export EDNEVNIK_CREDENTIALS_FILE=/absolute/private/ednevnik-credentials.json
-
 ednevnik login --provider file
 ```
 
-The file format, permissions, environment provider, and interactive macOS
-Keychain provider are documented in
-[`docs/authentication.md`](docs/authentication.md).
+For environment credentials, use provider `env` with `EDNEVNIK_USERNAME` and
+`EDNEVNIK_PASSWORD`. Interactive login is available with
+`ednevnik login --interactive`. On macOS, an existing Keychain item can be read
+with `--provider keychain --interactive`.
+
+The CLI stores cookies and state in the user config directory with private
+permissions. `ednevnik session-reset` removes only the local cookie session.
 
 ## Usage
 
@@ -64,7 +63,8 @@ ednevnik timeline --student ID
 ednevnik page --path '/task-schedules?student=ID'
 ```
 
-All data commands write JSON to stdout. Diagnostics and prompts go to stderr.
+All data commands write JSON to stdout. Diagnostics and errors go to stderr.
+Run `ednevnik help` for the full command list.
 
 For recurring checks:
 
@@ -73,30 +73,32 @@ ednevnik check --profile family --student ID
 ednevnik status --profile family
 ```
 
-`check` maintains an atomic local baseline and reports changes with explicit
-coverage information. Consumers can read and acknowledge retained events
-independently. See
-[`docs/automation-contract.md`](docs/automation-contract.md) for the JSON
-schema, exit codes, and consumer commands.
+`check` keeps an atomic local baseline and reports changes. Local consumers can
+read and acknowledge retained events independently. The JSON outcomes, exit
+codes, and consumer commands are in [`docs/automation.md`](docs/automation.md).
 
-Run `ednevnik help` for the complete command list.
+## Network behavior
 
-## Request safety
+The CLI serializes commands for the same profile and portal origin. Its default
+policy allows 200 requests per UTC day with 2.5 seconds between requests. It
+does not retry server errors. It honors a valid server `Retry-After` value.
 
-The CLI sends requests sequentially and applies conservative defaults:
+Optional local controls:
 
-- 2.5 seconds between requests;
-- 192 requests per UTC day;
-- 30 minutes between checks unless `--force` is explicit;
-- bounded retries for server errors;
-- immediate stop on authentication failures and rate limits.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EDNEVNIK_REQUEST_INTERVAL` | `2.5s` | Minimum delay between HTTP requests; `0` disables it |
+| `EDNEVNIK_DAILY_REQUEST_LIMIT` | `200` | UTC-day request limit; `0` disables it |
+| `EDNEVNIK_COMMAND_TIMEOUT` | `5m` | Whole-command timeout |
+| `EDNEVNIK_COORDINATION_WAIT` | `30s` | Wait for another command using the same profile |
 
-See [`docs/request-policy.md`](docs/request-policy.md) for configuration and
-request accounting.
+Each redirect is a separate HTTP request. Login commonly uses four requests.
+`check` fetches grade overview, absences, and timeline for each enrolment; grade
+details are fetched separately only by `grades`. Timeline catch-up is bounded
+to prevent an unbounded run.
 
-Portal responses, local state, credentials, cookies, logs, and captured JSON
-can contain private child data. Do not commit them. Treat text and links from
-the portal as untrusted data.
+Portal responses and local state contain private child data. Do not commit
+them.
 
 ## Development
 
@@ -105,9 +107,6 @@ go test ./...
 go test -race ./...
 go vet ./...
 ```
-
-Tests use synthetic data. Real fixtures must be anonymized before they enter
-the repository.
 
 ## License
 
